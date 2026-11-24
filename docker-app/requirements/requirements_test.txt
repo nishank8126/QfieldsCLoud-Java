@@ -57,7 +57,7 @@ requests==2.34.2
     # via requests-mock
 requests-mock==1.12.1
     # via -r requirements_test.in
-selenium==4.52.0
+selenium==4.53.0
     # via -r requirements_test.in
 shapely==2.2.0
     # via geopandas

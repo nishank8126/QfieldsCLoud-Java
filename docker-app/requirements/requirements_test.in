@@ -1,6 +1,6 @@
 imageio==2.*
 requests-mock==1.*
-selenium==4.52.0
+selenium==4.53.0
 coverage==7.15.4
 geopandas==1.2.0
 # NOTE keep in sync with the `convert2qgis` version in `docker-qgis/requirements_internal.txt`
