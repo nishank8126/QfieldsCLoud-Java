@@ -1,0 +1,2005 @@
+from __future__ import annotations
+
+import logging
+import uuid
+from datetime import datetime, timedelta
+from functools import cached_property
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
+
+from django.conf import settings
+from django.contrib.gis.db import models
+from django.contrib.gis.geos import GEOSException, GEOSGeometry
+from django.core.exceptions import ValidationError
+from django.core.validators import (
+    FileExtensionValidator,
+    MaxValueValidator,
+    MinValueValidator,
+    RegexValidator,
+)
+from django.db import transaction
+from django.db.models import Case, Exists, F, OuterRef, Prefetch, Q, When
+from django.db.models import Value as V
+from django.db.models.aggregates import Count, Sum
+from django.db.models.functions import MD5, Upper
+from django.shortcuts import get_object_or_404
+from django.urls import reverse_lazy
+from django.utils.html import format_html
+from django.utils.translation import gettext as _
+
+from qfieldcloud.core import validators
+from qfieldcloud.core.fields import DynamicStorageFileField
+from qfieldcloud.core.models import (
+    Job,
+    Organization,
+    PackageJob,
+    PackageJobQuerySet,
+    Person,
+    PersonQueryset,
+    Secret,
+    TeamMember,
+    User,
+)
+from qfieldcloud.core.models_utils import get_stored_value
+from qfieldcloud.project.enums import (
+    LayerErrorCode,
+    ProjectCollaboratorRole,
+    QgsFieldConstraintStrength,
+    QgsGeometryType,
+    QgsLayerType,
+    QtType,
+)
+
+if TYPE_CHECKING:
+    from django_stubs_ext import StrOrPromise
+
+    from qfieldcloud.core.models import (
+        JobQuerySet,
+        ProjectCollaboratorQueryset,
+        SecretQueryset,
+    )
+    from qfieldcloud.filestorage.models import File, FileQueryset, FileVersion
+    from qfieldcloud.project.type_defs import (
+        FieldDetails,
+        LayerDetails,
+        QgisProjectDetails,
+    )
+
+    pass
+
+SHARED_DATASETS_PROJECT_NAME = "shared_datasets"
+logger = logging.getLogger(__name__)
+
+
+class ProjectQueryset(models.QuerySet):
+    """Adds for_user(user) method to the project's querysets, allowing to filter only projects visible to that user.
+
+    Projects are annotated with the user's role (`user_role`) and the origin of this role (`user_role_origin`).
+
+    Args:
+        user:               user to check permission for
+
+    Usage:
+    ```
+    # List Olivier's projects that are visible to Ivan (olivier/ivan are User instances)
+    olivier.projects.for_user(ivan)
+    ```
+
+    Note:
+    This query is very similar to `PersonQueryset.for_project`, don't forget to update it too.
+    """
+
+    def for_user(self, user: User, skip_invalid: bool = False):
+        count = Count(
+            "collaborators",
+            filter=Q(collaborators__collaborator__type=User.Type.PERSON),
+        )
+        is_public_q = Q(is_public=True)
+        is_person_q = Q(owner__type=User.Type.PERSON)
+        is_org_q = Q(owner__type=User.Type.ORGANIZATION)
+        is_org_member_q = Q(owner__type=User.Type.ORGANIZATION) & Exists(
+            Organization.objects.of_user(user)  # type: ignore
+            .select_related(None)
+            .filter(id=OuterRef("owner"))
+        )
+        max_premium_collaborators_per_private_project_q = Q(
+            owner__useraccount__current_subscription_vw__active_plan__max_premium_collaborators_per_private_project=V(
+                -1
+            )
+        ) | Q(
+            owner__useraccount__current_subscription_vw__active_plan__max_premium_collaborators_per_private_project__gte=count
+        )
+
+        # Assemble the condition
+        is_valid_user_role_q = is_public_q | (
+            max_premium_collaborators_per_private_project_q
+            & (is_person_q | (is_org_q & is_org_member_q))
+        )
+
+        qs = (
+            self.defer("user_roles__user_id", "user_roles__project_id")
+            .filter(
+                user_roles__user=user,
+            )
+            .select_related("owner")
+            .annotate(
+                user_role=F("user_roles__name"),
+                user_role_origin=F("user_roles__origin"),
+                user_role_is_valid=Case(
+                    When(is_valid_user_role_q, then=True), default=False
+                ),
+                user_role_is_incognito=F("user_roles__is_incognito"),
+            )
+        )
+
+        if skip_invalid:
+            qs = qs.filter(user_role_is_valid=True)
+
+        return qs
+
+    def slim(self) -> ProjectQueryset:
+        """A minimal fetch of projects with only a few pre-loaded fields.
+
+        A light-weight fetch for permission checks, which run on every
+        request and only need a project's id, owner, and public flag.
+        """
+        return self.only("id", "name", "is_public", "project_type", "owner_id")
+
+    def with_prefetch(self) -> ProjectQueryset:
+        """A heavier version of the `Project` with all common `select_related` and `prefetch_related` in place."""
+        return (
+            self.select_related(
+                "qgis_project",
+                "owner",
+                "owner__useraccount",
+                "the_qgis_file",
+            )
+            .prefetch_related(
+                Prefetch(
+                    "qgis_project__layers",
+                    queryset=QgisLayer.objects.order_by("ordering"),
+                )
+            )
+            .annotate(
+                unfinished_jobs_count=Count(
+                    "jobs", filter=Q(jobs__status__in=Job.UNFINISHED_STATUS)
+                ),
+                # ideally we have `has_active_create_job`, but `annotate` does not support `Exists`
+                unfinished_create_jobs_count=Count(
+                    "jobs",
+                    filter=Q(
+                        jobs__type=Job.Type.CREATE_PROJECT,
+                        jobs__status__in=Job.UNFINISHED_STATUS,
+                    ),
+                ),
+            )
+        )
+
+
+def get_slim_project_or_raise(project_id: uuid.UUID | str | None) -> Project:
+    """Fetch a project for a permission check, or raise `Http404` if it doesn't exist.
+
+    Only use this where the caller needs `pk`/`owner`/`is_public` and nothing
+    else — the returned project has every other field deferred (see `slim()`
+    in `ProjectQueryset`). Fetching more fields off the result triggers extra queries,
+    so for anything that needs the full project, use `get_object_or_404(Project, ...)`.
+    """
+    # NOTE raises `Http404`, not `Project.DoesNotExist`: DRF treats both the same, see `core.rest_utils.exception_handler`.
+    # TODO @suricactus: add `qs.fetch_mode(models.RAISE)` once on Django 6.1, see https://app.clickup.com/t/2192114/QF-8624
+    return get_object_or_404(Project.objects.slim(), pk=project_id)  # type: ignore[attr-defined]
+
+
+def get_project_file_storage_default() -> str:
+    """Get the default file storage for the newly created project.
+
+    Returns:
+        the name of the storage
+    """
+    return settings.STORAGES_PROJECT_DEFAULT_STORAGE
+
+
+def get_project_attachments_file_storage_default() -> str:
+    """Get the default attachments file storage for the newly created project.
+
+    Returns:
+        the name of the storage
+    """
+    return settings.STORAGES_PROJECT_DEFAULT_ATTACHMENTS_STORAGE
+
+
+def get_project_are_attachments_versioned_default() -> bool:
+    """Get the default value for versioning of project attachments.
+
+    Returns:
+        whether the attachments are versioned by default
+    """
+    return settings.STORAGE_PROJECT_DEFAULT_ATTACHMENTS_VERSIONED
+
+
+def get_project_thumbnail_upload_to(instance: Project, _filename: str) -> str:
+    """Variable storage key for thumbnails.
+
+    We use a variable storage key to avoid creating object storage level versions for
+    thumbnails that we then would need to manage (purge old versions, make sure we don't
+    exceed version limit).
+    """
+    ts = datetime.now().strftime("v%Y%m%d%H%M%S")
+    # Random suffix because the second precision of the timestamp alone might
+    # not be enough to avoid collisions
+    suffix = str(uuid4())[:8]
+    return f"projects/{instance.id}/meta/thumbnail_{ts}_{suffix}.png"
+
+
+class Project(models.Model):
+    """Represent a QFieldcloud project.
+
+    It corresponds to a directory on the file system.
+
+    The owner of a project is an Organization.
+    """
+
+    # NOTE the status is NOT stored in the db, because it might be refactored
+    class Status(models.TextChoices):
+        OK = "ok", _("Ok")
+        BUSY = "busy", _("Busy")
+        FAILED = "failed", _("Failed")
+
+    class StatusCode(models.TextChoices):
+        OK = "ok", _("Ok")
+        FAILED_PROCESS_PROJECTFILE = (
+            "failed_process_projectfile",
+            _("Failed process projectfile"),
+        )
+        TOO_MANY_COLLABORATORS = "too_many_collaborators", _("Too many collaborators")
+
+    class PackagingOffliner(models.TextChoices):
+        QGISCORE = "qgiscore", _("QGIS Core Offline Editing (deprecated)")
+        PYTHONMINI = "pythonmini", _("Optimized Packager")
+
+    class ProjectType(models.TextChoices):
+        REGULAR = "regular", _("Regular")
+        SHARED_DATASETS = "shared_datasets", _("Shared Datasets")
+        TEMPLATE = "template", _("Template")
+
+    class UniqueConstraintDeltaBehavior(models.TextChoices):
+        """Needs to be kept in sync with the worker's apply deltas `UniqueConstraintDeltaBehavior` enum mirror."""
+
+        CREATE_CONFLICT = "create_conflict", _("Create a conflict")
+        QGIS_DEFAULT = "qgis_default", _("Let the QGIS default behavior apply")
+
+    # Project types configurable from clients
+    CONFIGURABLE_PROJECT_TYPES = [
+        ProjectType.REGULAR,
+        ProjectType.TEMPLATE,
+    ]
+
+    # Roles that can be granted to all users when a project is public.
+    PUBLIC_COLLABORATOR_ROLES = [
+        ProjectCollaboratorRole.READER,
+        ProjectCollaboratorRole.REPORTER,
+        ProjectCollaboratorRole.EDITOR,
+    ]
+
+    @property
+    def localized_layers(self) -> list[QgisLayer]:
+        """Retrieve all `QgisLayer` rows of this project's `QgisProject` that have their `is_localized` flag set to `True`.
+
+        Returns:
+            A list of `QgisLayer` instances with `is_localized == True`.
+            If the project has no associated `QgisProject`, returns an empty list.
+        """
+        qgis_project = getattr(self, "qgis_project", None)
+
+        if qgis_project is None:
+            return []
+
+        # filter the layers in Python to avoid an extra query to the database,
+        # since the `QgisLayer` instances are already fetched in memory via `prefetch_related`
+        return [layer for layer in qgis_project.layers.all() if layer.is_localized]
+
+    def _get_file_storage_name(self) -> str:
+        """Returns the file storage name where all the files are stored. Used by `DynamicStorageFileField` and `DynamicStorageFieldFile`."""
+        return self.file_storage
+
+    objects = ProjectQueryset.as_manager()
+
+    _status_code = StatusCode.OK
+
+    class Meta:
+        ordering = ["-is_featured", "owner__username", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                "owner",
+                Upper("name"),
+                name="project_owner_name_uniq",
+                violation_error_message="Project with the same name already exists.",
+            )
+        ]
+
+    # All files related to the project, including both the `PROJECT_FILE` and `PACKAGE_FILE` file types.
+    all_files: FileQueryset
+
+    # The secrets that are attached for a specific project.
+    secrets: SecretQueryset
+
+    # The jobs that are ran for a specific project.
+    jobs: JobQuerySet
+
+    # The project create seed.
+    seed: ProjectSeed
+
+    # The QGIS project for this project.
+    qgis_project: QgisProject
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(
+        max_length=255,
+        validators=[
+            RegexValidator(
+                r"^[a-zA-Z0-9-_\.]+$",
+                _("Only letters, numbers, underscores, hyphens and dots are allowed."),
+            )
+        ],
+        help_text=_(
+            _("Only letters, numbers, underscores, hyphens and dots are allowed.")
+        ),
+    )
+
+    description = models.TextField(blank=True)
+
+    the_qgis_file_id: int | None
+    the_qgis_file = models.ForeignKey(
+        "filestorage.File",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    is_public = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Projects marked as public are accessible to all users. Their access level is set by the public collaborator role."
+        ),
+    )
+
+    public_collaborator_role = models.CharField(
+        max_length=10,
+        choices=[(role.value, role.label) for role in PUBLIC_COLLABORATOR_ROLES],
+        default=ProjectCollaboratorRole.READER,
+        help_text=_(
+            "The role automatically granted to every user on this project. This setting only takes effect if the project is marked as public."
+        ),
+    )
+
+    project_type = models.CharField(
+        max_length=32, choices=ProjectType.choices, default=ProjectType.REGULAR
+    )
+
+    unique_constraint_delta_behavior = models.CharField(
+        max_length=32,
+        choices=UniqueConstraintDeltaBehavior.choices,
+        default=UniqueConstraintDeltaBehavior.CREATE_CONFLICT,
+        help_text=_(
+            "How the deltas should be handled when they violate field unique constraints."
+        ),
+    )
+
+    # the Person or Organization id that owns the project
+    owner_id: int
+
+    # the Person or Organization that owns the project
+    owner = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="projects",
+        limit_choices_to=models.Q(type__in=[User.Type.PERSON, User.Type.ORGANIZATION]),
+        help_text=_(
+            "The project owner can be either you or any of the organization you are member of."
+        ),
+    )
+
+    created_by = models.ForeignKey(
+        # NOTE should be `Person`, but Django sometimes has troubles with `Person`/`User` (e.g. `Form.full_clean()`), see #514 #515
+        User,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        limit_choices_to=models.Q(type=User.Type.PERSON),
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # These cache stats of the S3 storage. These can be out of sync, and should be
+    # refreshed whenever retrieving/uploading files by passing `project.save(recompute_storage=True)`
+    file_storage_bytes = models.PositiveBigIntegerField(default=0)
+
+    # NOTE we can track only the file based layers, WFS, WMS, PostGIS etc are impossible to track
+    data_last_updated_at = models.DateTimeField(blank=True, null=True)
+    data_last_packaged_at = models.DateTimeField(blank=True, null=True)
+
+    last_package_job_id: uuid.UUID
+    last_package_job = models.ForeignKey(
+        "core.PackageJob",
+        on_delete=models.SET_NULL,
+        related_name="last_job_of",
+        null=True,
+        blank=True,
+    )
+
+    repackaging_cache_expire = models.DurationField(
+        default=timedelta(minutes=60),
+        validators=[MinValueValidator(timedelta(minutes=1))],
+    )
+
+    overwrite_conflicts = models.BooleanField(
+        default=True,
+        help_text=_(
+            "If enabled, QFieldCloud will automatically overwrite conflicts in this project. Disabling this will force the project manager to manually resolve all the conflicts."
+        ),
+    )
+
+    has_restricted_projectfiles = models.BooleanField(
+        default=False,
+        verbose_name=_("Restrict project files"),
+        help_text=_(
+            "If enabled, modifications of QGIS project configuration (.qgs, qgz, qgd) and QField project plugins files will be restricted to managers and administrators."
+        ),
+    )
+
+    thumbnail = DynamicStorageFileField(
+        _("Thumbnail Picture"),
+        upload_to=get_project_thumbnail_upload_to,
+        # the s3 storage has 1024 bytes (not chars!) limit: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
+        max_length=1024,
+        null=True,
+        blank=True,
+        validators=[
+            FileExtensionValidator(allowed_extensions=("png", "jpg")),
+            validators.MaxImageDimensionValidator(
+                settings.QFIELDCLOUD_PROJECT_THUMBNAIL_MAX_DIMENSION
+            ),
+            validators.MaxFileSizeValidator(
+                settings.QFIELDCLOUD_PROJECT_THUMBNAIL_MAX_BYTES
+            ),
+        ],
+    )
+
+    # Duplicating logic from the plan's storage_keep_versions
+    # so that users use less file versions (therefore storage)
+    # than as per their plan's default on specific projects.
+    # WARNING: If storage_keep_versions == 0, it will delete all file versions (hence the file itself) !
+    storage_keep_versions = models.PositiveIntegerField(
+        _("File versions to keep"),
+        help_text=_(
+            "Use this value to limit the maximum number of file versions. If empty, your current plan's default will be used. Not configurable for free users."
+        ),
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(100)],
+    )
+
+    # Packaging offliner to be used by the QGIS worker container.
+    packaging_offliner = models.CharField(
+        _("Packaging Offliner"),
+        help_text=_(
+            'The Packaging Offliner packages data for offline use with QField. The new "Optimized Packager" should be preferred over the deprecated "QGIS Core Offline Editing" for new projects.'
+        ),
+        max_length=100,
+        default=PackagingOffliner.PYTHONMINI,
+        choices=PackagingOffliner.choices,
+    )
+
+    file_storage = models.CharField(
+        _("File storage"),
+        help_text=_(
+            "Which file storage provider should be used for the storing the project related files."
+        ),
+        max_length=100,
+        validators=[validators.file_storage_name_validator],
+        default=get_project_file_storage_default,
+    )
+
+    # NOTE `Project.qgis_version` is used by `wrapper.JobRun.get_qgis_image()` to detect
+    # the correct QGIS docker image to run the job.
+    # Therefore, we cannot use the very similar `QgisProject.qgis_version` field,
+    # which is not populated until the first `process_projectfile` job is run.
+    qgis_version = models.CharField(
+        _("QGIS project version"),
+        help_text=_(
+            "The QGIS project version as detected from the uploaded project file."
+        ),
+        max_length=100,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
+    file_storage_migrated_at = models.DateTimeField(
+        _("File Storage Migrated At"),
+        blank=True,
+        null=True,
+        editable=False,
+    )
+
+    locked_at = models.DateTimeField(
+        _("Locked at"),
+        help_text=_(
+            "If not null, it means that the project is being migrated, and the datetime represents when the project was temporarily locked. Locking is internal QFieldCloud mechanism related to file storage migration or other file operations."
+        ),
+        blank=True,
+        null=True,
+        editable=False,
+    )
+
+    is_featured = models.BooleanField(
+        _("Is featured"),
+        help_text=_(
+            "If set to true, the project will always appear on top of the project list, no matter the sorting. If multiple projects are featured, they will be sorted by the user defined sorting."
+        ),
+        default=False,
+    )
+
+    attachments_file_storage = models.CharField(
+        _("Attachments file storage"),
+        help_text=_(
+            "Which file storage provider should be used for storing the project attachments files."
+        ),
+        max_length=100,
+        validators=[validators.file_storage_name_validator],
+        default=get_project_attachments_file_storage_default,
+    )
+
+    # When enabled, the client (e.g. QField) is informed that attachments
+    # can be fetched on demand at a later stage instead of downloading in bulk with the other package files.
+    # This can reduce the size of packaged data, especially for
+    # projects with large or numerous attachments.
+    is_attachment_download_on_demand = models.BooleanField(
+        default=False,
+        verbose_name=_("On demand attachment files download"),
+        help_text=_(
+            "If enabled, attachment files should be downloaded on demand with QField."
+        ),
+    )
+
+    are_attachments_versioned = models.BooleanField(
+        default=get_project_are_attachments_versioned_default,
+        verbose_name=_("Versioned attachment files"),
+        help_text=_(
+            "If enabled, attachment files will make use of the file versioning system. If disabled, only the latest version of each attachment file will be kept, and stored with the extension in the filename."
+        ),
+    )
+
+    restricted_data_last_updated_at = models.DateTimeField(
+        _("Restricted data last updated at"),
+        blank=True,
+        null=True,
+        editable=False,
+    )
+
+    @cached_property
+    def shared_datasets_project(self) -> Project | None:
+        """Returns the localized datasets project for the same owner, or `None` if no such project exists."""
+        try:
+            project = Project.objects.get(
+                project_type=self.ProjectType.SHARED_DATASETS,
+                owner=self.owner,
+            )
+            return project
+        except Project.DoesNotExist:
+            return None
+
+    def package_jobs_for_user(self, user: User) -> PackageJobQuerySet:
+        """Returns all package jobs for the user.
+
+        Args:
+            user: The user to check for.
+
+        Returns:
+            QuerySet of all package jobs for the user.
+        """
+        secret_filters = Q(project=self, organization=None, assigned_to=user)
+
+        if self.owner.is_organization:
+            secret_filters |= Q(project=None, organization=self.owner, assigned_to=user)
+
+        secret_qs = Secret.objects.filter(secret_filters)
+
+        jobs_qs = self.jobs.filter(
+            type=Job.Type.PACKAGE,
+        )
+
+        jobs_qs = jobs_qs.annotate(has_user_secret=Exists(secret_qs)).filter(
+            Q(has_user_secret=False) | Q(triggered_by=user)
+        )
+
+        return jobs_qs
+
+    def latest_finished_package_job_for_user(self, user: User) -> PackageJob | None:
+        """Returns the last finished package job for the user.
+
+        Args:
+            user: The user to check for.
+
+        Returns:
+            The last finished package job for the user.
+        """
+        return (
+            self.package_jobs_for_user(user).finished().order_by("-created_at").first()
+        )
+
+    def latest_package_job_for_user(self, user: User) -> PackageJob | None:
+        """Returns the last package job for the user.
+
+        Args:
+            user: The user to check for.
+
+        Returns:
+            The last package job for the user.
+        """
+        return self.package_jobs_for_user(user).order_by("-created_at").first()
+
+    def latest_package_jobs(self) -> PackageJobQuerySet:
+        """Returns all the last package jobs for the users of the project.
+
+        Returns:
+            QuerySet of all the last package jobs.
+        """
+        jobs_qs = (
+            PackageJob.objects.filter(
+                project_id=self.id,
+            )
+            .order_by("triggered_by", "-created_at")
+            .distinct("triggered_by")
+        )
+
+        if self.is_public:
+            return jobs_qs
+
+        if self.owner.is_organization:
+            # all the users including the organization owner
+            triggered_by_qs = Person.objects.for_organization(self.owner)
+        else:
+            triggered_by_qs = Person.objects.filter(id=self.owner.pk)
+
+        triggered_by_qs |= Person.objects.filter(
+            id__in=self.direct_collaborators.values_list("collaborator_id", flat=True)
+        )
+        triggered_by_ids_qs = triggered_by_qs.distinct().values_list("id", flat=True)
+
+        jobs_qs = jobs_qs.filter(triggered_by__in=triggered_by_ids_qs)
+
+        return jobs_qs
+
+    @cached_property
+    def is_regular_project(self) -> bool:
+        """Returns `True` if the project type is a regular project, otherwise `False`."""
+        return self.project_type == self.ProjectType.REGULAR
+
+    @cached_property
+    def is_shared_datasets_project(self) -> bool:
+        """Returns `True` if the project is the shared datasets project, otherwise `False`.
+
+        Deprecated: use `project_type` instead.
+        """
+        return self.project_type == self.ProjectType.SHARED_DATASETS
+
+    @cached_property
+    def is_template_project(self) -> bool:
+        """Returns `True` if the project type is a template project, otherwise `False`."""
+        return self.project_type == self.ProjectType.TEMPLATE
+
+    def get_missing_localized_layers(self) -> list[QgisLayer]:
+        """Return list of missing localized layers.
+
+        Of all localized layers, return those whose filenames aren’t in `available_filenames`,
+        which means they are not present in the associated localized datasets project storage.
+
+        Returns:
+            A list of `QgisLayer` instances (same as in `localized_layers`) that need to be added/uploaded.
+        """
+        from qfieldcloud.filestorage.models import File
+
+        qgis_project = getattr(self, "qgis_project", None)
+
+        if qgis_project is None:
+            return []
+
+        if not self.shared_datasets_project:
+            # Return all layers if the project is missing
+            return self.localized_layers
+
+        available_filenames = (
+            File.objects.with_type_project()
+            .filter(project=self.shared_datasets_project)
+            .values_list("name", flat=True)
+        )
+
+        missing_localized_layers = []
+        for layer in self.localized_layers:
+            if not layer.file_name:
+                continue
+
+            filename = layer.file_name.split("localized:")[-1]
+
+            if filename not in available_filenames:
+                missing_localized_layers.append(layer)
+
+        return missing_localized_layers
+
+    @property
+    def has_the_qgis_file(self) -> bool:
+        return self.the_qgis_file is not None
+
+    @property
+    def the_qgis_file_name(self) -> str | None:
+        if self.the_qgis_file is None:
+            return None
+
+        return self.the_qgis_file.name
+
+    @property
+    def owner_aware_storage_keep_versions(self) -> int:
+        """Determine the storage versions to keep based on the owner's subscription plan and project settings.
+
+        Returns:
+            the number of file versions, should be always greater than 1
+        """
+        subscription = self.owner.useraccount.current_subscription
+
+        if subscription.plan.is_premium:
+            keep_count = (
+                self.storage_keep_versions or subscription.plan.storage_keep_versions
+            )
+        else:
+            keep_count = subscription.plan.storage_keep_versions
+
+        assert keep_count >= 1, "Ensure that we don't destroy all file versions!"
+
+        return keep_count
+
+    @property
+    def thumbnail_url(self) -> StrOrPromise:
+        """Returns the url to the project's thumbnail or empty string if no URL provided."""
+        if not self.thumbnail:
+            return ""
+
+        return reverse_lazy(
+            "filestorage_project_thumbnails",
+            kwargs={
+                "project_id": self.id,
+            },
+        )
+
+    def __str__(self):
+        return f"{self.owner.username}/{self.name} [id={self.id}]"
+
+    @property
+    def name_with_owner(self) -> str:
+        return f"{self.owner.username}/{self.name}"
+
+    @property
+    def has_attachments_files(self) -> bool:
+        """Checks if the project has at least one attachment file."""
+        return any(f.is_attachment() for f in self.project_files)
+
+    @property
+    def private(self) -> bool:
+        # still used in the project serializer
+        return not self.is_public
+
+    @property
+    def project_files(self) -> FileQueryset:
+        """Returns the files of type PROJECT related to the project."""
+        return self.all_files.with_type_project()
+
+    @property
+    def project_files_count(self) -> int:
+        return self.project_files.count()
+
+    @property
+    def users(self):
+        return User.objects.for_project(self)
+
+    @property
+    def has_online_vector_data(self) -> bool | None:
+        """Returns None if the project has no associated `QgisProject`."""
+        qgis_project = getattr(self, "qgis_project", None)
+
+        if qgis_project is None:
+            return None
+
+        from qfieldcloud.project.utils.project_utils import has_online_vector_data
+
+        return has_online_vector_data(self)
+
+    @property
+    def can_repackage(self) -> bool:
+        if self.is_template_project:
+            return False
+        else:
+            return True
+
+    def needs_repackaging(self, user: User) -> bool:
+        latest_package_job_for_user = self.latest_package_job_for_user(user)
+
+        if (
+            # if has_online_vector_data is None (happens when the project details are missing)
+            # we assume there might be
+            self.has_online_vector_data is False
+            and self.data_last_updated_at
+            and self.data_last_packaged_at
+            and latest_package_job_for_user
+        ):
+            # if all vector layers are file based and have been packaged for the user after the last update,
+            # it is safe to say there are no modifications.
+            if latest_package_job_for_user.finished_at:
+                return (
+                    latest_package_job_for_user.finished_at < self.data_last_updated_at
+                )
+            else:
+                return True
+        else:
+            # if the project has online vector layers (PostGIS/WFS/etc) we cannot be sure if there are modification or not, so better say there are
+            return True
+
+    @property
+    def has_active_create_job(self) -> bool:
+        """Check if there's an active create_project job."""
+        if not hasattr(self, "seed") or self.seed is None:
+            return False
+
+        if hasattr(self, "unfinished_create_jobs_count"):
+            return self.unfinished_create_jobs_count > 0
+
+        return (
+            self.jobs.unfinished()
+            .filter(
+                type=Job.Type.CREATE_PROJECT,
+            )
+            .exists()
+        )
+
+    @property
+    def problems(self) -> list[dict[str, Any]]:
+        problems = []
+
+        # If there is an active create job, return empty list
+        if self.has_active_create_job:
+            problems.append(
+                {
+                    "layer": None,
+                    "level": "info",
+                    "code": "project_being_created",
+                    "description": _("Project being created."),
+                    "solution": _(
+                        "Your project is currently being set up. This may take a few moments."
+                    ),
+                }
+            )
+
+            return problems
+
+        # Check if localized datasets project, then skip the rest of the checks as they are not applicable
+        if self.is_shared_datasets_project:
+            if self.has_the_qgis_file:
+                problems.append(
+                    {
+                        "layer": None,
+                        "level": "error",
+                        "code": "qgis_project_file_not_allowed",
+                        "description": _(
+                            "Shared datasets projects cannot contain QGIS project files (.qgs/.qgz)."
+                        ),
+                        "solution": _(
+                            "Remove the QGIS project file (.qgs/.qgz) or rename the project to use it normally."
+                        ),
+                    }
+                )
+
+            return problems
+
+        if not self.has_the_qgis_file:
+            problems.append(
+                {
+                    "layer": None,
+                    "level": "error",
+                    "code": "missing_projectfile",
+                    "description": _("Missing QGIS project file (.qgs/.qgz)."),
+                    "solution": _(
+                        "Make sure a QGIS project file (.qgs/.qgz) is uploaded to QFieldCloud. Reupload the file if problem persists."
+                    ),
+                }
+            )
+
+        elif getattr(self, "qgis_project", None):
+            if self.localized_layers:
+                if self.shared_datasets_project:
+                    localized_project_url = reverse_lazy(
+                        "project_overview",
+                        kwargs={
+                            "username": self.shared_datasets_project.owner.username,
+                            "project": self.shared_datasets_project.name,
+                        },
+                    )
+                    missing_localized_file_solution = format_html(
+                        _(
+                            'Upload the missing file to the "<a href="{}">{}</a>" project or update the layer to point to an available file.'
+                        ),
+                        localized_project_url,
+                        SHARED_DATASETS_PROJECT_NAME,
+                    )
+                else:
+                    problems.append(
+                        {
+                            "layer": None,
+                            "level": "warning",
+                            "code": "missing_localized_project",
+                            "description": format_html(
+                                _('Cannot find the "{}" project.'),
+                                SHARED_DATASETS_PROJECT_NAME,
+                            ),
+                            "solution": _("Ensure the shared dataset project exists."),
+                        }
+                    )
+                    missing_localized_file_solution = format_html(
+                        _(
+                            'Upload the missing file to the "{}" project or update the layer to point to an available file.'
+                        ),
+                        SHARED_DATASETS_PROJECT_NAME,
+                    )
+
+                for missing_layer in self.get_missing_localized_layers():
+                    problems.append(
+                        {
+                            "layer": missing_layer.file_name,
+                            "level": "warning",
+                            "code": "missing_localized_file",
+                            "description": format_html(
+                                _('Localized dataset stored at "{}" is missing.'),
+                                missing_layer.file_name,
+                            ),
+                            "solution": missing_localized_file_solution,
+                        }
+                    )
+
+            for layer in self.qgis_project.layers.all():
+                layer_name = layer.name
+
+                # All the layers stored in the localized datasets project will be with errors, so we just skip them. We handled them separately before this for loop.
+                if layer.error_code == "localized_dataprovider":
+                    continue
+
+                if layer.error_code != "no_error":
+                    problems.append(
+                        {
+                            "layer": layer_name,
+                            "level": "warning",
+                            "code": "layer_problem",
+                            "description": format_html(
+                                _('Layer "{}" has an error with code "{}": {}'),
+                                layer_name,
+                                layer.error_code,
+                                layer.error_summary,
+                            ),
+                            "solution": _(
+                                'Check the latest "process_projectfile" job logs for more info and reupload the project files with the required changes.'
+                            ),
+                        }
+                    )
+                # the layer is missing a primary key, warn it is going to be read-only, unless it is already marked as read-only in QGIS
+                elif layer.layer_type == QgsLayerType.Vector:
+                    if (
+                        layer.qfs_settings.get("qfc_source_data_pk_name") == ""
+                        and not layer.is_readonly
+                    ):
+                        problems.append(
+                            {
+                                "layer": layer_name,
+                                "level": "warning",
+                                "code": "layer_problem",
+                                "description": format_html(
+                                    _(
+                                        'Layer "{}" does not support the `primary key` attribute. The layer will be read-only on QField.'
+                                    ),
+                                    layer_name,
+                                ),
+                                "solution": _(
+                                    "To make the layer editable on QField, store the layer data in a GeoPackage or PostGIS layer, using a single column for the primary key."
+                                ),
+                            }
+                        )
+
+                # add a warning if a pg layer has a hard-coded user or pwd in the datasource
+                if layer.provider_name == "postgres" and (
+                    "user=" in layer.datasource or "password=" in layer.datasource
+                ):
+                    problems.append(
+                        {
+                            "layer": layer_name,
+                            "level": "warning",
+                            "code": "hardcoded_pg_credentials",
+                            "description": format_html(
+                                _(
+                                    'Layer "{}" has a hard-coded postgres credentials in the datasource.'
+                                ),
+                                layer_name,
+                            ),
+                            "solution": _(
+                                _(
+                                    "Consider using a pg_service entry and a QFieldCloud Secret instead."
+                                )
+                            ),
+                        }
+                    )
+        else:
+            problems.append(
+                {
+                    "layer": None,
+                    "level": "error",
+                    "code": "missing_project_details",
+                    "description": _("Failed to parse metadata from project."),
+                    "solution": _("Re-upload the QGIS project file (.qgs/.qgz)."),
+                }
+            )
+
+        return problems
+
+    @property
+    def has_unfinished_jobs(self) -> bool:
+        if hasattr(self, "unfinished_jobs_count"):
+            return self.unfinished_jobs_count > 0
+
+        return self.jobs.unfinished().exists()
+
+    @cached_property
+    def status(self) -> Project.Status:
+        # NOTE the status is NOT stored in the db, because it might be outdated
+        if self.has_unfinished_jobs:
+            return Project.Status.BUSY
+        else:
+            status = Project.Status.OK
+            status_code = Project.StatusCode.OK
+
+            # TODO use self.problems to get if there are project problems
+            if (
+                not self.has_the_qgis_file or not getattr(self, "qgis_project", None)
+            ) and not self.is_shared_datasets_project:
+                status = Project.Status.FAILED
+                status_code = Project.StatusCode.FAILED_PROCESS_PROJECTFILE
+            elif not self.is_public and self.exceeds_private_collaborator_limit:
+                status = Project.Status.FAILED
+                status_code = Project.StatusCode.TOO_MANY_COLLABORATORS
+
+            self._status_code = status_code
+            return status
+
+    @property
+    def status_code(self) -> StatusCode:
+        return self._status_code
+
+    @property
+    def storage_size_perc(self) -> float:
+        if self.owner.useraccount.current_subscription.active_storage_total_bytes > 0:
+            return (
+                self.file_storage_bytes
+                / self.owner.useraccount.current_subscription.active_storage_total_bytes
+                * 100
+            )
+        else:
+            return 100
+
+    @property
+    def direct_collaborators(self) -> ProjectCollaboratorQueryset:
+        """Collaborators that are individual people added straight to the project.
+
+        Doesn't include members from collaborating teams, incognito collaborators
+        and the owner.
+        """
+        if self.owner.is_organization:
+            exclude_pks = [self.owner.organization.organization_owner_id]
+        else:
+            exclude_pks = [self.owner_id]
+
+        return (
+            self.collaborators.skip_incognito()  # type: ignore[attr-defined]
+            .filter(
+                collaborator__type=User.Type.PERSON,
+            )
+            .exclude(
+                collaborator_id__in=exclude_pks,
+            )
+        )
+
+    @property
+    def total_collaborators(self) -> PersonQueryset:
+        """Every person with access to the project, whether added directly or as a member of a team that collaborates on it.
+
+        Merges the direct collaborators with the members of each collaborating team,
+        drops the owner and incognito entries, and returns a deduplicated `Person` queryset.
+        """
+        if self.owner.is_organization:
+            exclude_pks = [self.owner.organization.organization_owner_id]
+        else:
+            exclude_pks = [self.owner_id]
+
+        team_collaborators_ids = (
+            self.collaborators.skip_incognito()  # type: ignore[attr-defined]
+            .filter(collaborator__type=User.Type.TEAM)
+            .values_list("collaborator_id", flat=True)
+        )
+        direct_ids = self.direct_collaborators.values_list("collaborator_id", flat=True)
+        team_member_ids = (
+            TeamMember.objects.filter(team_id__in=team_collaborators_ids)
+            .exclude(member_id__in=exclude_pks)
+            .values_list("member_id", flat=True)
+        )
+        return cast(
+            "PersonQueryset",
+            Person.objects.filter(
+                Q(pk__in=direct_ids) | Q(pk__in=team_member_ids)
+            ).distinct(),
+        )
+
+    @property
+    def total_collaborators_count(self) -> int:
+        """Number of people returned by `total_collaborators`."""
+        return self.total_collaborators.count()
+
+    @property
+    def exceeds_private_collaborator_limit(self) -> bool:
+        """Whether the project has more direct collaborators than the owner's plan allows on a private project.
+
+        Always `False` when the plan sets no limit.
+        """
+        plan = self.owner.useraccount.current_subscription.plan
+        max_collaborators = plan.max_premium_collaborators_per_private_project
+        return (
+            max_collaborators != -1
+            and max_collaborators < self.direct_collaborators.count()
+        )
+
+    @property
+    def owner_can_create_job(self):
+        # NOTE consider including in status refactoring
+
+        from qfieldcloud.core.permissions_utils import (
+            is_supported_regarding_owner_account,
+        )
+
+        return is_supported_regarding_owner_account(self)
+
+    def clean(self, *args, **kwargs) -> None:
+        is_shared_datasets_type = self.project_type == self.ProjectType.SHARED_DATASETS
+
+        if is_shared_datasets_type and self.name != SHARED_DATASETS_PROJECT_NAME:
+            raise ValidationError(
+                _(
+                    "Project type cannot be set to `{}` unless the project is named `{}`."
+                ).format(self.ProjectType.SHARED_DATASETS, SHARED_DATASETS_PROJECT_NAME)
+            )
+
+        if (
+            not is_shared_datasets_type
+            and self.project_type not in self.CONFIGURABLE_PROJECT_TYPES
+        ):
+            raise ValidationError(
+                _("Project type must be one of `{}`, got `{}`.").format(
+                    self.CONFIGURABLE_PROJECT_TYPES, self.project_type
+                )
+            )
+
+        if self.public_collaborator_role not in self.PUBLIC_COLLABORATOR_ROLES:
+            raise ValidationError(
+                _("`public_collaborator_role` must be one of `{}`, got `{}`.").format(
+                    self.PUBLIC_COLLABORATOR_ROLES, self.public_collaborator_role
+                )
+            )
+
+        self._validate_make_private()
+
+        super().clean(*args, **kwargs)
+
+    def _validate_make_private(self) -> None:
+        """Blocks turning a "public" project "private" while it has collaborators that a "private" project would not accept.
+
+        That happens when a collaborator is not a member of the owning organization,
+        or when the collaborator count is over what the owner's plan allows on a private project.
+
+        Only the switch from public to private is checked. A project that is already
+        private and over the limit (say, after a plan downgrade) is left as it is.
+        """
+        # only when an existing public project is being turned private
+        if self.is_public or get_stored_value(self, "is_public") is not True:
+            return
+
+        if self.owner.is_organization:
+            member_ids = self.owner.organization.members.values_list(
+                "member_id", flat=True
+            )
+            non_member_usernames = sorted(
+                self.direct_collaborators.exclude(
+                    collaborator_id__in=member_ids
+                ).values_list("collaborator__username", flat=True)
+            )
+            if non_member_usernames:
+                raise ValidationError(
+                    _(
+                        "This project has collaborators who are not members of the "
+                        "organization: {}. Remove them, or add them to the "
+                        "organization, before making it private."
+                    ).format(", ".join(non_member_usernames))
+                )
+
+        if self.exceeds_private_collaborator_limit:
+            # NOTE: if `exceeds_private_collaborator_limit` changes, this validation logic should be updated accordingly.
+            plan_limit = self.owner.useraccount.current_subscription.plan.max_premium_collaborators_per_private_project
+            raise ValidationError(
+                _(
+                    "This project has {} collaborators but the owner's plan allows "
+                    "only {} on a private project. Remove some collaborators before "
+                    "making it private."
+                ).format(self.direct_collaborators.count(), plan_limit)
+            )
+
+    def save(self, recompute_storage=False, *args, **kwargs):
+        self.clean()
+        logger.debug(f"Saving project {self}...")
+        additional_update_fields = set()
+
+        if recompute_storage:
+            self.file_storage_bytes = self.project_files.aggregate(
+                file_storage_bytes=Sum("versions__size", default=0)
+            )["file_storage_bytes"]
+
+            additional_update_fields.add("file_storage_bytes")
+
+        # Ensure that the Project's storage_keep_versions is at least 1, and reflects the plan's default storage_keep_versions value.
+        if not self.storage_keep_versions:
+            self.storage_keep_versions = (
+                self.owner.useraccount.current_subscription.plan.storage_keep_versions
+            )
+
+            additional_update_fields.add("storage_keep_versions")
+
+        assert self.storage_keep_versions >= 1, (
+            "If 0, storage_keep_versions mean that all file versions are deleted!"
+        )
+
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = list(
+                set(kwargs["update_fields"]) | additional_update_fields
+            )
+
+        if self.name == SHARED_DATASETS_PROJECT_NAME:
+            self.project_type = self.ProjectType.SHARED_DATASETS
+
+        super().save(*args, **kwargs)
+
+    def get_file(self, filename: str) -> File:
+        return self.project_files.get_by_name(filename)  # type: ignore
+
+
+def get_seed_xlsform_upload_to(instance: ProjectSeed, filename: str) -> str:
+    file_extension = Path(filename).suffix.lower()
+    return f"projects/{instance.project.id}/seeds/xlsforms/xlsform{file_extension}"
+
+
+def get_seed_json2qgis_upload_to(instance: "ProjectSeed", filename: str) -> str:
+    file_extension = Path(filename).suffix.lower()
+    return f"projects/{instance.project.id}/seeds/json2qgis/json2qgis{file_extension}"
+
+
+class ProjectSeed(models.Model):
+    SETTINGS_SCHEMA_ID = "https://app.qfield.cloud/schemas/project-seed-20251201.json"
+    """Represents the seed data version used to create a project."""
+
+    project = models.OneToOneField(
+        "project.Project",
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="seed",
+    )
+    """The project the seed refers to."""
+
+    clone_from_project = models.ForeignKey(
+        "project.Project",
+        on_delete=models.CASCADE,
+        null=True,
+        related_name="derived_seeds",
+        blank=True,
+    )
+    """The project to copy from, if any. It is mutually exclusive with `xlsform_file` and `json2qgis_file`."""
+
+    # TODO @Rakanhf: make the `extent` field not nullable once we add `Project.extent` field.
+    extent = models.PolygonField(
+        null=True,
+        blank=True,
+        srid=4326,
+    )
+    """The initial extent of the project as EPSG:4326 polygon."""
+
+    xlsform_file = models.FileField(
+        upload_to=get_seed_xlsform_upload_to,
+        # the s3 storage has 1024 bytes (not chars!) limit: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
+        max_length=1024,
+        null=True,
+        blank=True,
+    )
+    """XLSForm file used to create the project, if any. It is mutually exclusive with `clone_from_project` and `json2qgis_file`."""
+
+    json2qgis_file = models.FileField(
+        upload_to=get_seed_json2qgis_upload_to,
+        # the s3 storage has 1024 bytes (not chars!) limit: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
+        max_length=1024,
+        null=True,
+        blank=True,
+    )
+    """JSON project definition file used to create the project, if any. It is mutually exclusive with `clone_from_project` and `xlsform_file`."""
+
+    settings = models.JSONField()
+    """The settings used during the project creation. There must be a `schemaId` field."""
+
+    def clean(self, *args, **kwargs) -> None:
+        provided_sources = [
+            bool(self.xlsform_file),
+            bool(self.json2qgis_file),
+            bool(self.clone_from_project),
+        ]
+        if sum(provided_sources) > 1:
+            raise ValidationError(
+                _(
+                    "At most one of `xlsform_file`, `json2qgis_file` or `clone_from_project` can be set at the same time."
+                )
+            )
+
+        # TODO @Rakanhf: make the `extent` field not nullable once we add `Project.extent` field.
+        if not self.extent and not self.clone_from_project:
+            raise ValidationError(
+                _("Either `extent` or `clone_from_project` must be set.")
+            )
+
+        if not self.settings.get("schemaId"):
+            raise ValidationError(_("The seed settings schemaId must be present."))
+
+        super().clean(*args, **kwargs)
+
+    def save(self, *args, **kwargs) -> None:
+        self.full_clean()
+
+        return super().save(*args, **kwargs)
+
+
+def to_geom_or_none(geom_str: str | None, srid: int = 4326) -> GEOSGeometry | None:
+    """geom_wkt may be WKT, EWKT or HEXEWKB."""
+    if not geom_str:
+        return None
+
+    try:
+        return GEOSGeometry(geom_str, srid=srid)
+    except (GEOSException, ValueError) as err:
+        logger.warning(f"Failed to parse {geom_str=}! Error: {err}.")
+        return None
+
+
+class QgisProjectQueryset(models.QuerySet):
+    @transaction.atomic()
+    def update_from_details(
+        self,
+        project: Project,
+        file_version: FileVersion,
+        details: QgisProjectDetails,
+    ) -> QgisProject:
+        custom_properties = {
+            QgisProject.ATTACHMENT_DIRS_KEY: details.get("attachment_dirs") or ["DCIM"],
+            QgisProject.DATA_DIRS_KEY: details.get("data_dirs") or [],
+        }
+
+        qgis_project, _ = self.update_or_create(
+            project=project,
+            defaults={
+                "file_version": file_version,
+                "name": details.get("project_name"),
+                "qgis_version": (details.get("qgis_version") or "")[:100],
+                "crs": details.get("crs") or "",
+                "extent": to_geom_or_none(details.get("extent")),
+                "area_of_interest": to_geom_or_none(details.get("area_of_interest")),
+                "background_color": details.get("background_color") or "#ffffff",
+                "custom_properties": custom_properties,
+            },
+        )
+
+        layers_by_id = details.get("layers_by_id") or {}
+        ordered_layer_ids = details.get("ordered_layer_ids") or []
+
+        QgisLayer.objects.update_from_details(  # type: ignore[attr-defined]
+            qgis_project, ordered_layer_ids, layers_by_id
+        )
+
+        return qgis_project
+
+
+class QgisProject(models.Model):
+    ATTACHMENT_DIRS_KEY = "attachment_dirs"
+    DATA_DIRS_KEY = "data_dirs"
+
+    objects = QgisProjectQueryset.as_manager()
+
+    project = models.OneToOneField(
+        Project,
+        on_delete=models.CASCADE,
+        related_name="qgis_project",
+        primary_key=True,
+        help_text=_("The QFieldCloud project that this QGIS project belongs to."),
+    )
+
+    file_version = models.OneToOneField(
+        "filestorage.FileVersion",
+        on_delete=models.CASCADE,
+        related_name="qgis_project",
+        help_text=_("The QGIS file version that this project belongs to."),
+    )
+
+    name = models.TextField(
+        help_text=_("Project name as defined in the QGIS project file.")
+    )
+
+    qgis_version = models.CharField(
+        _("QGIS project version"),
+        help_text=_(
+            "The QGIS project version as detected from the uploaded project file."
+        ),
+        max_length=100,
+        blank=True,
+        editable=False,
+    )
+
+    crs = models.TextField(
+        help_text=_("The coordinate reference system of the project as EPSG code.")
+    )
+
+    extent = models.PolygonField(
+        null=True,
+        blank=True,
+        srid=4326,
+        help_text=_("The extent of the project in WGS84 coordinates."),
+    )
+
+    area_of_interest = models.PolygonField(
+        null=True,
+        blank=True,
+        srid=4326,
+        help_text=_("The area of interest of the project in WGS84 coordinates."),
+    )
+
+    background_color = models.CharField(
+        max_length=7,
+        default="#ffffff",
+        help_text=_("The background color of the project as a hex color code."),
+    )
+
+    custom_properties = models.JSONField(
+        default=dict,
+        help_text=_(
+            """A dictionary of custom properties that can be used to store
+            additional information about the project. QFieldSync configured properties are set here.
+            """
+        ),
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # The layers that belong to this QGIS project.
+    layers: QgisLayerQuerySet
+
+    @property
+    def attachment_dirs(self) -> list[str]:
+        """Returns a list of configured attachment dirs for the project.
+
+        Attachment dir is a special directory in the QField infrastructure that holds attachment files
+        such as images, pdf etc. By default "DCIM" is considered a attachment directory.
+
+        Returns:
+            A list configured attachment dirs for the project.
+        """
+        attachment_dirs = []
+
+        if self.custom_properties and self.custom_properties.get(
+            self.ATTACHMENT_DIRS_KEY
+        ):
+            attachment_dirs = self.custom_properties.get(self.ATTACHMENT_DIRS_KEY, [])
+
+        if not attachment_dirs:
+            attachment_dirs = ["DCIM"]
+
+        return attachment_dirs
+
+    @property
+    def data_dirs(self) -> list[str]:
+        """Returns a list of configured data dirs for the project.
+
+        Data dir is a special directory in the QField infrastructure that holds assets
+        used by the project symbology, layouts, or project plugins.
+
+        Unlike `attachmentDirs`, the `dataDirs` should always be served as a undivisible
+        part of project files.
+
+        Returns:
+            A list configured data dirs for the project.
+        """
+        data_dirs = []
+
+        if self.custom_properties and self.custom_properties.get(self.DATA_DIRS_KEY):
+            data_dirs = self.custom_properties.get(self.DATA_DIRS_KEY, [])
+
+        return data_dirs
+
+
+class QgisLayerQuerySet(models.QuerySet):
+    @transaction.atomic()
+    def update_from_details(
+        self,
+        qgis_project: QgisProject,
+        ordered_layer_ids: list[str],
+        layers_by_id: dict[str, LayerDetails],
+    ) -> None:
+        """Sync QGIS project's `QgisLayer` rows to match `layers_by_id`.
+
+        Creates/updates a `QgisLayer` row per entry in `layers_by_id`, in the order
+        given by `ordered_layer_ids`, then deletes any existing `QgisLayer` rows
+        for the project that were not present in this update.
+
+        Existing rows are only written to the database if a field actually
+        changed, to avoid needless `updated_at` bumps and writes on re-sync.
+        """
+        existing_layers_by_qgis_layer_id = {}
+        for layer in qgis_project.layers.select_for_update():
+            existing_layers_by_qgis_layer_id[layer.qgis_layer_id] = layer
+
+        qgis_layer_ids_to_keep = set()
+
+        for ordering, qgis_layer_id in enumerate(ordered_layer_ids):
+            layer_data = layers_by_id.get(qgis_layer_id)
+            if layer_data is None:
+                continue
+
+            geom_type = layer_data.get("geom_type")
+            if geom_type is None:
+                geom_type = QgsGeometryType.Null
+
+            defaults = {
+                "name": layer_data.get("name"),
+                "crs": layer_data.get("crs"),
+                "geom_type": geom_type,
+                "wkb_type_name": layer_data.get("wkb_type_name") or "",
+                "layer_type": layer_data.get("type"),
+                "provider_name": layer_data.get("provider_name") or "",
+                "ordering": ordering,
+                "datasource": layer_data.get("datasource") or "",
+                "file_name": layer_data.get("filename") or "",
+                "is_valid": layer_data.get("is_valid", False),
+                "is_localized": layer_data.get("is_localized", False),
+                "is_readonly": layer_data.get("is_readonly", None),
+                "error_code": layer_data.get("error_code") or LayerErrorCode.NO_ERROR,
+                "error_summary": layer_data.get("error_summary") or "",
+                "error_message": layer_data.get("error_message") or "",
+                "provider_error_summary": layer_data.get("provider_error_summary")
+                or "",
+                "provider_error_message": layer_data.get("provider_error_message")
+                or "",
+                "qfs_settings": {
+                    "qfs_action": layer_data.get("qfs_action"),
+                    "qfs_cloud_action": layer_data.get("qfs_cloud_action"),
+                    "qfs_photo_naming": layer_data.get("qfs_photo_naming"),
+                    "qfs_is_geometry_locked": layer_data.get("qfs_is_geometry_locked"),
+                    "qfs_unsupported_source_pk": layer_data.get(
+                        "qfs_unsupported_source_pk"
+                    ),
+                    "qfc_source_data_pk_name": layer_data.get(
+                        "qfc_source_data_pk_name"
+                    ),
+                },
+            }
+
+            existing_layer = existing_layers_by_qgis_layer_id.get(qgis_layer_id)
+
+            # If this `qgis_layer_id` has no matching row, create a new `QgisLayer`.
+            # If it does, update only the fields that changed, otherwise skip the
+            # save entirely.
+            if existing_layer is None:
+                layer = QgisLayer(
+                    qgis_project=qgis_project,
+                    qgis_layer_id=qgis_layer_id,
+                    **defaults,
+                )
+                layer.save()
+            else:
+                layer = existing_layer
+                changed_fields = []
+                for field, value in defaults.items():
+                    if getattr(existing_layer, field) != value:
+                        setattr(existing_layer, field, value)
+                        changed_fields.append(field)
+
+                if changed_fields:
+                    existing_layer.save(
+                        update_fields=[*changed_fields, "updated_at"],
+                    )
+
+            QgisLayerField.objects.update_from_details(  # type: ignore[attr-defined]
+                layer, layer_data.get("fields") or []
+            )
+
+            qgis_layer_ids_to_keep.add(qgis_layer_id)
+
+        # Delete by primary key the layers that were not present in this update.
+        layer_ids_to_delete = []
+        for qgis_layer_id, existing_layer in existing_layers_by_qgis_layer_id.items():
+            if qgis_layer_id not in qgis_layer_ids_to_keep:
+                layer_ids_to_delete.append(existing_layer.id)
+
+        if layer_ids_to_delete:
+            qgis_project.layers.filter(id__in=layer_ids_to_delete).delete()
+
+
+class QgisLayer(models.Model):
+    objects = QgisLayerQuerySet.as_manager()
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    qgis_project = models.ForeignKey(
+        to=QgisProject,
+        on_delete=models.CASCADE,
+        related_name="layers",
+        help_text=_("QGIS project that this layer belongs to."),
+    )
+
+    qgis_layer_id = models.TextField(help_text=_("QGIS layer id."))
+
+    name = models.TextField(help_text=_("QGIS layer name."))
+
+    crs = models.TextField(
+        blank=True,
+        help_text=_(
+            "The coordinate reference system of the layer as EPSG code. Empty for non-spatial layers, e.g. a database table with no geometry column."
+        ),
+    )
+
+    geom_type = models.PositiveSmallIntegerField(
+        choices=QgsGeometryType.choices,
+        help_text=_("The geometry type of the layer."),
+    )
+
+    # The name comes from QGIS's own `Qgis.WkbType` enum (`Qgis::WkbType`).
+    # Source: `enum class WkbType` in `src/core/qgis.h` in the
+    # QGIS repo (https://github.com/qgis/QGIS/blob/master/src/core/qgis.h#L293).
+    wkb_type_name = models.CharField(
+        blank=True,
+        max_length=50,
+        help_text=_(
+            "The WKB type of the layer, stored by name since the WKB type enum is very big."
+        ),
+    )
+
+    layer_type = models.PositiveSmallIntegerField(
+        choices=QgsLayerType.choices,
+        help_text=_("The type of the layer, e.g. vector, raster, etc."),
+    )
+
+    provider_name = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("The name of the data provider, e.g. `ogr`, `gdal`, `postgres`."),
+    )
+
+    ordering = models.PositiveIntegerField(
+        help_text=_("The order position of the layer within the project.")
+    )
+
+    datasource = models.TextField(
+        blank=True,
+        help_text=_(
+            "QGIS layer datasource string. Empty for layers with no data source, e.g. group layers."
+        ),
+    )
+
+    file_name = models.TextField(
+        blank=True, help_text=_("The (main) filename in the datasource.")
+    )
+
+    is_valid = models.BooleanField(
+        default=False, help_text=_("Whether the layer is valid.")
+    )
+
+    is_localized = models.BooleanField(
+        default=False, help_text=_("Whether the layer is using a localized dataset.")
+    )
+
+    is_readonly = models.BooleanField(
+        null=True,
+        default=None,
+        help_text=_("Whether the layer is marked as read-only in the QGIS project."),
+    )
+
+    error_code = models.CharField(
+        max_length=100,
+        choices=LayerErrorCode.choices,
+        default=LayerErrorCode.NO_ERROR,
+        help_text=_("A code representing the error reason if the layer is not valid."),
+    )
+
+    error_summary = models.TextField(
+        blank=True,
+        help_text=_("A short summary of the error, if the layer is not valid."),
+    )
+
+    error_message = models.TextField(
+        blank=True,
+        help_text=_("The full error message from QGIS, if the layer is not valid."),
+    )
+
+    provider_error_summary = models.TextField(
+        blank=True,
+        help_text=_(
+            "A short summary of the data provider error, if the data provider is not valid."
+        ),
+    )
+
+    provider_error_message = models.TextField(
+        blank=True,
+        help_text=_("The full data provider error, if the data provider is not valid."),
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    qfs_settings = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text=_(
+            "A dict of settings configured by QFieldSync and consumed by libqfieldsync, QFieldSync, QField and QFieldCloud."
+        ),
+    )
+
+    # The fields that belong to this layer.
+    fields: "QgisLayerFieldQuerySet"
+
+    class Meta:
+        verbose_name = _("QGIS layer")
+        verbose_name_plural = _("QGIS layers")
+        ordering = ["qgis_project", "ordering"]
+        constraints = [
+            # `qgis_layer_id` is unbounded and can be too large for a Postgres
+            # btree index row, so this indexes MD5(qgis_layer_id) instead.
+            models.UniqueConstraint(
+                F("qgis_project"),
+                MD5("qgis_layer_id"),
+                name="layer_qgis_project_qgis_layer_id_md5_uniq",
+            )
+        ]
+
+
+class QgisLayerFieldQuerySet(models.QuerySet):
+    @staticmethod
+    def _get_constraint_strength(value: str | None) -> QgsFieldConstraintStrength:
+        """Returns the matching `QgsFieldConstraintStrength`, or `NOT_SET` if `value` is missing or unknown."""
+        if value in QgsFieldConstraintStrength.values:
+            return QgsFieldConstraintStrength(value)
+
+        return QgsFieldConstraintStrength.NOT_SET
+
+    @transaction.atomic()
+    def update_from_details(
+        self,
+        layer: "QgisLayer",
+        fields: "list[FieldDetails]",
+    ) -> None:
+        """Sync a `QgisLayer`'s `QgisLayerField`'s to match `fields`.
+
+        Creates/updates a `QgisLayerField` per entry in `fields`, in the
+        given order, then deletes any existing `QgisLayerField` for the
+        layer that were not present in this update.
+
+        Existing fields are only updated in the database if a field actually
+        changed, to avoid needless writes on re-sync.
+        """
+        existing_fields_by_name = {}
+        for field in layer.fields.select_for_update():
+            existing_fields_by_name[field.name] = field
+
+        field_names_to_keep = set()
+
+        for ordering, field_data in enumerate(fields):
+            name = field_data.get("name")
+            if not name:
+                continue
+
+            # Store `type` only if it is an integer, otherwise store `None`.
+            field_type = field_data.get("type")
+            if not isinstance(field_type, int):
+                field_type = None
+
+            defaults = {
+                "ordering": ordering,
+                "alias": field_data.get("alias") or "",
+                "comment": field_data.get("comment") or "",
+                "type": field_type,
+                "type_display": field_data.get("type_display") or "",
+                "length": field_data.get("length") or 0,
+                "precision": field_data.get("precision") or 0,
+                "is_not_null_strength": self._get_constraint_strength(
+                    field_data.get("constraint_strength")
+                ),
+                "constraint_expression": field_data.get("constraint_expression") or "",
+                "constraint_expression_description": field_data.get(
+                    "constraint_expression_description"
+                )
+                or "",
+                "constraint_expression_strength": self._get_constraint_strength(
+                    field_data.get("constraint_expression_strength")
+                ),
+                "is_unique_strength": self._get_constraint_strength(
+                    field_data.get("is_unique_strength")
+                ),
+                "default_value": field_data.get("default_value") or "",
+                "set_default_value_on_update": bool(
+                    field_data.get("set_default_value_on_update")
+                ),
+                "widget_type": field_data.get("widget_type") or "",
+                "widget_config": field_data.get("widget_config") or {},
+            }
+
+            existing_field = existing_fields_by_name.get(name)
+
+            # If this `name` has no match, create a new `QgisLayerField`.
+            # If it does, update only the fields that changed, otherwise
+            # skip the save entirely.
+            if existing_field is None:
+                QgisLayerField(layer=layer, name=name, **defaults).save()
+            else:
+                changed_fields = []
+                for field, value in defaults.items():
+                    if getattr(existing_field, field) != value:
+                        setattr(existing_field, field, value)
+                        changed_fields.append(field)
+
+                if changed_fields:
+                    existing_field.save(update_fields=changed_fields)
+
+            field_names_to_keep.add(name)
+
+        # Delete by primary key the fields that were not present in this update.
+        field_ids_to_delete = []
+        for name, existing_field in existing_fields_by_name.items():
+            if name not in field_names_to_keep:
+                field_ids_to_delete.append(existing_field.id)
+
+        if field_ids_to_delete:
+            layer.fields.filter(id__in=field_ids_to_delete).delete()
+
+
+class QgisLayerField(models.Model):
+    """A single field  of a QgisLayer, as read from the QGIS project.
+
+    Close mirror to QGIS's `QgsField` class, with additional fields for QFieldCloud's purposes.
+    QGIS repo source: https://github.com/qgis/QGIS/blob/master/src/core/qgsfield.h
+    """
+
+    objects = QgisLayerFieldQuerySet.as_manager()
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    layer = models.ForeignKey(
+        to=QgisLayer,
+        on_delete=models.CASCADE,
+        related_name="fields",
+        help_text=_("The QGIS layer that owns this field."),
+    )
+
+    ordering = models.PositiveIntegerField(
+        help_text=_("The position in order of the field within the layer.")
+    )
+
+    name = models.TextField(
+        help_text=_("Field name as defined in the QGIS layer data source.")
+    )
+
+    alias = models.TextField(
+        blank=True, help_text=_("Optional user-facing alias configured in QGIS.")
+    )
+
+    comment = models.TextField(
+        blank=True,
+        help_text=_("Optional field comment or description configured in QGIS."),
+    )
+
+    type = models.PositiveIntegerField(
+        null=True,
+        choices=QtType.choices,
+        help_text=_("QGIS field type as a Qt type enum value."),
+    )
+
+    # NOTE The provider type name is unbounded.
+    type_display = models.TextField(
+        blank=True,
+        help_text=_("QGIS field type display name"),
+    )
+
+    length = models.IntegerField(
+        default=0, help_text=_("Declared field length reported by QGIS.")
+    )
+
+    precision = models.IntegerField(
+        default=0, help_text=_("Declared numeric precision reported by QGIS.")
+    )
+
+    is_not_null_strength = models.CharField(
+        max_length=10,
+        choices=QgsFieldConstraintStrength.choices,
+        default=QgsFieldConstraintStrength.NOT_SET,
+        help_text=_("Strength of the not-null constraint."),
+    )
+
+    constraint_expression = models.TextField(
+        blank=True,
+        help_text=_("Optional QGIS constraint expression."),
+    )
+
+    constraint_expression_description = models.TextField(
+        blank=True,
+        help_text=_(
+            "Optional human-readable error message when the constraint expression is violated."
+        ),
+    )
+
+    constraint_expression_strength = models.CharField(
+        max_length=10,
+        choices=QgsFieldConstraintStrength.choices,
+        default=QgsFieldConstraintStrength.NOT_SET,
+        help_text=_("Strength of the expression constraint."),
+    )
+
+    is_unique_strength = models.CharField(
+        max_length=10,
+        choices=QgsFieldConstraintStrength.choices,
+        default=QgsFieldConstraintStrength.NOT_SET,
+        help_text=_("Strength of the unique constraint."),
+    )
+
+    default_value = models.TextField(
+        blank=True, help_text=_("QGIS default value expression for new features.")
+    )
+
+    set_default_value_on_update = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Whether QGIS reapplies the default value when a feature is updated."
+        ),
+    )
+
+    # NOTE Plugins can register editor widgets with arbitrary names.
+    widget_type = models.TextField(
+        blank=True,
+        help_text=_("QGIS editor widget type configured for the field."),
+    )
+
+    widget_config = models.JSONField(
+        blank=True, default=dict, help_text=_("QGIS editor widget configuration.")
+    )
+
+    class Meta:
+        verbose_name = _("QGIS layer field")
+        verbose_name_plural = _("QGIS layer fields")
+        ordering = ["layer_id", "ordering"]
+        constraints = [
+            # `name` is unbounded and can be too large for a Postgres btree index row, so this indexes MD5(name) instead.
+            models.UniqueConstraint(
+                F("layer"),
+                MD5("name"),
+                name="field_layer_name_md5_uniq",
+            )
+        ]

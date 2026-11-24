@@ -1,0 +1,2345 @@
+import io
+import json
+import logging
+import time
+from io import StringIO
+from unittest.mock import patch
+
+from django.contrib.gis.geos import Polygon
+from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError, transaction
+from django.test import override_settings
+from rest_framework import status
+from rest_framework.test import APITransactionTestCase
+
+from qfieldcloud.authentication.models import AuthToken
+from qfieldcloud.core.models import (
+    Job,
+    Organization,
+    OrganizationMember,
+    Person,
+    ProjectCollaborator,
+    Team,
+    TeamMember,
+)
+from qfieldcloud.core.tests.utils import (
+    set_subscription,
+    setup_subscription_plans,
+    testdata_path,
+    wait_for_project_ok_status,
+)
+from qfieldcloud.filestorage.models import File, FileVersion
+from qfieldcloud.project.enums import (
+    ProjectCollaboratorRole,
+    QgsGeometryType,
+    QgsLayerType,
+)
+from qfieldcloud.project.models import (
+    SHARED_DATASETS_PROJECT_NAME,
+    Project,
+    ProjectSeed,
+    QgisLayer,
+    QgisProject,
+)
+from qfieldcloud.project.utils import projectseed_utils
+from qfieldcloud.subscription.models import Subscription
+
+logging.disable(logging.CRITICAL)
+
+
+class QfcTestCase(APITransactionTestCase):
+    def setUp(self):
+        setup_subscription_plans()
+
+        # Create a user
+        self.user1 = Person.objects.create_user(username="user1", password="abc123")
+        self.token1 = AuthToken.objects.get_or_create(user=self.user1)[0]
+
+        # Create a user
+        self.user2 = Person.objects.create_user(username="user2", password="abc123")
+        self.token2 = AuthToken.objects.get_or_create(user=self.user2)[0]
+
+        # Create a user
+        self.user3 = Person.objects.create_user(username="user3", password="abc123")
+        self.token3 = AuthToken.objects.get_or_create(user=self.user3)[0]
+
+    def _create_clonable_project(self):
+        project = Project.objects.create(
+            name="project_to_clone",
+            owner=self.user1,
+            is_public=False,
+            overwrite_conflicts=True,
+            has_restricted_projectfiles=True,
+            is_attachment_download_on_demand=True,
+        )
+
+        ProjectSeed.objects.create(
+            project=project,
+            extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+            settings={
+                "schemaId": ProjectSeed.SETTINGS_SCHEMA_ID,
+                "basemaps": [],
+                "xlsform": None,
+            },
+        )
+
+        Job.objects.create(
+            project=project,
+            type=Job.Type.CREATE_PROJECT,
+            created_by=self.user1,
+        )
+
+        wait_for_project_ok_status(project)
+
+        return project
+
+    def test_create_project(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "api_created_project",
+                "owner": "user1",
+                "description": "desc",
+                "is_public": False,
+            },
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project = Project.objects.get(name="api_created_project")
+        # Will raise exception if it doesn't exist
+
+        self.assertEqual(str(project.owner), "user1")
+
+    def test_create_project_invalid_name(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "project$",
+                "owner": "user1",
+                "description": "desc",
+                "is_public": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_project_with_seed_and_xlsform(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        xlsform = SimpleUploadedFile(
+            "survey.xlsx",
+            b"fake xlsform content",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        seed = json.dumps(
+            {
+                "basemap_provider": "osm",
+                "basemap_style": "standard",
+                "extent": "22,41,29,45.67",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "seed_project",
+                "owner": "user1",
+                "is_public": False,
+                "seed": seed,
+                "xlsform_file": xlsform,
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        project = Project.objects.get(name="seed_project")
+        self.assertTrue(ProjectSeed.objects.filter(project=project).exists())
+        self.assertTrue(
+            Job.objects.filter(project=project, type=Job.Type.CREATE_PROJECT).exists()
+        )
+
+        seed_obj = ProjectSeed.objects.get(project=project)
+        self.assertEqual(len(seed_obj.settings["basemaps"]), 1)
+        self.assertEqual(
+            seed_obj.settings["basemaps"][0]["name"], "OpenStreetMap (Standard)"
+        )
+        self.assertIsNotNone(seed_obj.settings["xlsform"])
+        self.assertTrue(seed_obj.xlsform_file)
+
+        self.assertNotIn("seed", response.data)
+        self.assertNotIn("xlsform_file", response.data)
+
+    def test_create_project_with_json2qgis(self):
+        """Project creation validates the seed/json2qgis/xlsform combination."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        seed = json.dumps(
+            {
+                "basemap_provider": "osm",
+                "basemap_style": "standard",
+                "extent": "22,41,29,45.67",
+            }
+        )
+
+        with self.subTest(
+            "Test seed with json2qgis creates the project and attaches the file"
+        ):
+            # The create endpoint only checks that `json2qgis_file` is present and
+            # it doesn't validate the file's schema, so a fake blob is enough here.
+            json2qgis_content = b'{"fake": "json2qgis content"}'
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "seed_json2qgis_project",
+                    "owner": "user1",
+                    "is_public": False,
+                    "seed": seed,
+                    "json2qgis_file": SimpleUploadedFile(
+                        "project.json",
+                        json2qgis_content,
+                        content_type="application/json",
+                    ),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+            project = Project.objects.get(name="seed_json2qgis_project")
+            self.assertEqual(
+                Job.objects.filter(
+                    project=project, type=Job.Type.CREATE_PROJECT
+                ).count(),
+                1,
+            )
+
+            seed_obj = ProjectSeed.objects.get(project=project)
+            self.assertEqual(seed_obj.json2qgis_file.read(), json2qgis_content)
+            self.assertFalse(seed_obj.xlsform_file)
+            self.assertIsNone(seed_obj.settings["xlsform"])
+
+            self.assertNotIn("seed", response.data)
+            self.assertNotIn("json2qgis_file", response.data)
+
+        with self.subTest(
+            "Test the API rejects xlsform and json2qgis together, creates no project"
+        ):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "seed_both_files",
+                    "owner": "user1",
+                    "is_public": False,
+                    "seed": seed,
+                    "xlsform_file": SimpleUploadedFile("survey.xlsx", b"xls"),
+                    "json2qgis_file": SimpleUploadedFile("project.json", b"{}"),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.data["code"], "multiple_project_seed_sources")
+            self.assertEqual(Project.objects.filter(name="seed_both_files").count(), 0)
+
+        with self.subTest("Test the API rejects json2qgis without a seed"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "json2qgis_no_seed",
+                    "owner": "user1",
+                    "is_public": False,
+                    "json2qgis_file": SimpleUploadedFile("project.json", b"{}"),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                Project.objects.filter(name="json2qgis_no_seed").count(), 0
+            )
+
+    def test_projectseed_clean_rejects_multiple_sources(self):
+        project = Project.objects.create(
+            name="multi_source_seed", owner=self.user1, is_public=False
+        )
+
+        with self.assertRaises(ValidationError):
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+                xlsform_file=ContentFile(b"xls", "survey.xlsx"),
+                json2qgis_file=ContentFile(b"{}", "project.json"),
+            )
+
+    def test_seed_json2qgis_download(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest(
+            "Test download returns the file content with the correct content-disposition filename"
+        ):
+            project = Project.objects.create(
+                name="json2qgis_download", owner=self.user1, is_public=False
+            )
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+                json2qgis_file=ContentFile(b'{"a": 1}', "project.json"),
+            )
+
+            response = self.client.get(f"/api/v1/projects/{project.id}/seed/json2qgis/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(
+                response["Content-Disposition"],
+                'attachment; filename="json2qgis.json"',
+            )
+            self.assertEqual(b"".join(response.streaming_content), b'{"a": 1}')
+
+        with self.subTest("Test download 404s when the seed has no json2qgis file"):
+            project = Project.objects.create(
+                name="json2qgis_absent", owner=self.user1, is_public=False
+            )
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+            )
+
+            response = self.client.get(f"/api/v1/projects/{project.id}/seed/json2qgis/")
+            self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_create_project_with_seed_no_xlsform(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        seed = json.dumps(
+            {
+                "basemap_provider": "osm",
+                "basemap_style": "grayscale_light",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "seed_no_xls",
+                "owner": "user1",
+                "is_public": False,
+                "seed": seed,
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        project = Project.objects.get(name="seed_no_xls")
+        seed_obj = ProjectSeed.objects.get(project=project)
+        self.assertEqual(len(seed_obj.settings["basemaps"]), 1)
+        self.assertEqual(
+            seed_obj.settings["basemaps"][0]["name"],
+            "OpenStreetMap (Grayscale Light)",
+        )
+        self.assertIsNone(seed_obj.settings["xlsform"])
+
+    def test_create_project_without_seed(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "empty_project",
+                "owner": "user1",
+                "is_public": False,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        project = Project.objects.get(name="empty_project")
+        self.assertFalse(ProjectSeed.objects.filter(project=project).exists())
+        self.assertFalse(
+            Job.objects.filter(project=project, type=Job.Type.CREATE_PROJECT).exists()
+        )
+
+    def test_create_project_invalid_seed_json(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "bad_json_project",
+                "owner": "user1",
+                "is_public": False,
+                "seed": "{not valid json",
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_project_custom_basemap_no_url(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        seed = json.dumps(
+            {
+                "basemap_provider": "custom",
+                "basemap_style": "standard",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "custom_no_url",
+                "owner": "user1",
+                "is_public": False,
+                "seed": seed,
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_project_seed_rollback_on_bad_extent(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        seed = json.dumps(
+            {
+                "basemap_provider": "osm",
+                "basemap_style": "standard",
+                "extent": "not,valid,extent,data",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "rollback_project",
+                "owner": "user1",
+                "is_public": False,
+                "seed": seed,
+            },
+            format="multipart",
+        )
+        self.assertNotEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(Project.objects.filter(name="rollback_project").exists())
+
+    def test_list_public_projects(self):
+        # Create a public project of user2
+        self.project1 = Project.objects.create(
+            name="project1", is_public=True, owner=self.user2
+        )
+
+        # Create a private project of user2
+        self.project1 = Project.objects.create(
+            name="project2", is_public=False, owner=self.user2
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # 1) do not list the public projects by default
+        response = self.client.get("/api/v1/projects/")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 0)
+
+        # 1) list the public projects on request
+        response = self.client.get("/api/v1/projects/?include-public=1")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "project1")
+        self.assertEqual(response.data[0]["owner"], "user2")
+
+        # 1) do not list the public projects for any other value than 1
+        response = self.client.get("/api/v1/projects/?include-public=true")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 0)
+
+    def test_list_projects_excluding_project_type(self):
+        # Create a `regular` project for user1
+        Project.objects.create(name="project1", owner=self.user1)
+
+        # Create a `shared_datasets` project for user1
+        Project.objects.create(name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # `shared_datasets` is listed by default
+        response = self.client.get("/api/v1/projects/")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 2)
+
+        # `exclude_project_type` removes it
+        response = self.client.get(
+            "/api/v1/projects/?exclude_project_type=shared_datasets"
+        )
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "project1")
+
+        # `exclude_project_type` with an unknown project type is rejected
+        response = self.client.get("/api/v1/projects/?exclude_project_type=bogus")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_collaborators_of_project(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Add user2 as collaborator
+        ProjectCollaborator.objects.create(
+            project=self.project1,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.MANAGER,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.get(f"/api/v1/collaborators/{self.project1.id}/")
+
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+
+        json = response.json()
+        json = sorted(json, key=lambda k: k["collaborator"])
+
+        self.assertEqual(json[0]["collaborator"], "user2")
+        self.assertEqual(json[0]["role"], "manager")
+
+    def test_list_filtered_projects(self):
+        # Create a project of user1 with public access to user2
+        Project.objects.create(name="project1", is_public=True, owner=self.user1)
+
+        # Create a project of user1 without access to user2
+        Project.objects.create(name="project2", is_public=False, owner=self.user1)
+
+        # Create a private project of user2
+        Project.objects.create(name="project1", is_public=False, owner=self.user2)
+
+        # Create a public project of user2
+        Project.objects.create(name="project2", is_public=True, owner=self.user2)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+
+        # 1) list non-public projects for specific user name other than the logged in user
+        response = self.client.get("/api/v1/projects/?owner=user1")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 0)
+
+        # 1) list all projects (including public ones) for specific user name other than the logged in user
+        response = self.client.get("/api/v1/projects/?owner=user1&include-public=1")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "project1")
+        self.assertEqual(response.data[0]["owner"], "user1")
+
+        # 2) list projects for specific user name matching logged in user
+        response = self.client.get("/api/v1/projects/?owner=user2")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 2)
+
+        json = response.json()
+        json = sorted(json, key=lambda k: k["name"])
+        self.assertEqual(json[0]["name"], "project1")
+        self.assertEqual(json[0]["owner"], "user2")
+        self.assertEqual(json[1]["name"], "project2")
+        self.assertEqual(json[1]["owner"], "user2")
+
+        # 3) list project for specific user name (matching logged in user) and project name
+        response = self.client.get("/api/v1/projects/?owner=user2&name=project2")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "project2")
+        self.assertEqual(response.data[0]["owner"], "user2")
+
+    def test_list_projects_of_authenticated_user(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Create another project of user1
+        self.project2 = Project.objects.create(
+            name="project2", is_public=False, owner=self.user1
+        )
+
+        # Create a project of user2 without access to user1
+        self.project3 = Project.objects.create(
+            name="project3", is_public=False, owner=self.user2
+        )
+
+        self.project4 = Project.objects.create(
+            name="project4", is_public=False, owner=self.user2
+        )
+
+        ProjectCollaborator.objects.create(
+            project=self.project4,
+            collaborator=self.user1,
+            role=ProjectCollaboratorRole.MANAGER,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.get("/api/v1/projects/")
+
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 3)
+
+        json = response.json()
+        json = sorted(json, key=lambda k: k["name"])
+
+        self.assertEqual(json[0]["name"], "project1")
+        self.assertEqual(json[0]["owner"], "user1")
+        self.assertEqual(json[0]["user_role"], "admin")
+        self.assertEqual(json[0]["user_role_origin"], "project_owner")
+        self.assertEqual(json[1]["name"], "project2")
+        self.assertEqual(json[1]["owner"], "user1")
+        self.assertEqual(json[1]["user_role"], "admin")
+        self.assertEqual(json[1]["user_role_origin"], "project_owner")
+        self.assertEqual(json[2]["user_role"], "manager")
+        self.assertEqual(json[2]["user_role_origin"], "collaborator")
+
+    def test_create_collaborator(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.post(
+            f"/api/v1/collaborators/{self.project1.id}/",
+            {
+                "collaborator": "user2",
+                "role": "editor",
+            },
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        collaborators = ProjectCollaborator.objects.all()
+        self.assertEqual(len(collaborators), 1)
+        self.assertEqual(collaborators[0].project, self.project1)
+        self.assertEqual(collaborators[0].collaborator, self.user2)
+        self.assertEqual(collaborators[0].role, ProjectCollaboratorRole.EDITOR)
+
+    def test_create_collaborator_on_project_of_another_user(self):
+        project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+        project2 = Project.objects.create(
+            name="project2", is_public=False, owner=self.user2
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+        response = self.client.post(
+            f"/api/v1/collaborators/{project1.id}/",
+            {
+                "projectid": str(project2.id),
+                "collaborator": "user2",
+                "role": "admin",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            ProjectCollaborator.objects.filter(
+                project=project1, collaborator=self.user2
+            ).exists()
+        )
+
+    def test_get_collaborator(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Add user2 as collaborator
+        ProjectCollaborator.objects.create(
+            project=self.project1,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.REPORTER,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.get(f"/api/v1/collaborators/{self.project1.id}/user2/")
+
+        self.assertTrue(status.is_success(response.status_code))
+        json = response.json()
+        self.assertEqual(json["collaborator"], "user2")
+        self.assertEqual(json["role"], "reporter")
+
+    def test_update_collaborator(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Add user2 as collaborator
+        ProjectCollaborator.objects.create(
+            project=self.project1,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.REPORTER,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.patch(
+            f"/api/v1/collaborators/{self.project1.id}/user2/",
+            {
+                "role": "admin",
+            },
+        )
+
+        self.assertTrue(status.is_success(response.status_code))
+
+        collaborators = ProjectCollaborator.objects.all()
+        self.assertEqual(len(collaborators), 1)
+        self.assertEqual(collaborators[0].project, self.project1)
+        self.assertEqual(collaborators[0].collaborator, self.user2)
+        self.assertEqual(collaborators[0].role, ProjectCollaboratorRole.ADMIN)
+
+    def test_delete_collaborator(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Add user2 as collaborator
+        ProjectCollaborator.objects.create(
+            project=self.project1,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.REPORTER,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.delete(
+            f"/api/v1/collaborators/{self.project1.id}/user2/"
+        )
+
+        self.assertTrue(status.is_success(response.status_code))
+
+        collaborators = ProjectCollaborator.objects.all()
+        self.assertEqual(len(collaborators), 0)
+
+    def test_delete_project(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project of user1
+        project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+
+        # Delete the project
+        response = self.client.delete(f"/api/v1/projects/{project1.id}/")
+        self.assertTrue(status.is_success(response.status_code))
+
+        # The project should not exist anymore
+        self.assertFalse(Project.objects.filter(id=project1.id).exists())
+
+    def test_update_project_of_another_user(self):
+        project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1, description="desc"
+        )
+        project2 = Project.objects.create(
+            name="project2", is_public=False, owner=self.user2
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+        response = self.client.patch(
+            f"/api/v1/projects/{project1.id}/",
+            {"projectid": str(project2.id), "description": "changed"},
+            format="json",
+        )
+
+        self.assertFalse(status.is_success(response.status_code))
+        project1.refresh_from_db()
+        self.assertEqual(project1.description, "desc")
+
+    def test_delete_project_of_another_user(self):
+        project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user1
+        )
+        project2 = Project.objects.create(
+            name="project2", is_public=False, owner=self.user2
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+        response = self.client.delete(
+            f"/api/v1/projects/{project1.id}/",
+            {"projectid": str(project2.id)},
+            format="json",
+        )
+
+        self.assertFalse(status.is_success(response.status_code))
+        self.assertTrue(Project.objects.filter(id=project1.id).exists())
+
+    def test_error_responses(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project of user1
+        project1 = Project.objects.create(
+            name="project1", is_public=False, owner=self.user2
+        )
+
+        # Get the project without permissions
+        response = self.client.get(f"/api/v1/projects/{project1.id}/")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "permission_denied")
+
+        # Get an unexisting project id
+        response = self.client.get(
+            "/api/v1/projects/{}/".format("a258db08-b1cb-4c34-a0cc-1e0e2a464f87")
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.json()["code"], "object_not_found")
+
+        # Get a project without a valid project id
+        response = self.client.get("/api/v1/projects/{}/".format("pizza"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "validation_error")
+
+    def test_public_projecs(self):
+        # Create a project of user1
+        self.project1 = Project.objects.create(
+            name="project1", is_public=True, owner=self.user1
+        )
+
+        # Create another project of user2
+        self.project2 = Project.objects.create(
+            name="project2", is_public=True, owner=self.user2
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.get("/api/v1/projects/public", follow=True)
+
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 2)
+
+        json = response.json()
+        json = sorted(json, key=lambda k: k["name"])
+
+        self.assertEqual(json[0]["name"], "project1")
+        self.assertEqual(json[0]["owner"], "user1")
+        self.assertEqual(json[0]["user_role"], "admin")
+        self.assertEqual(json[0]["user_role_origin"], "project_owner")
+        self.assertEqual(json[1]["name"], "project2")
+        self.assertEqual(json[1]["owner"], "user2")
+        self.assertEqual(json[1]["user_role"], "reader")
+        self.assertEqual(json[1]["user_role_origin"], "public")
+
+    def test_public_project_uses_public_collaborator_role(self):
+        """A public project's `public_collaborator_role` determines the role granted to non-collaborators, and only while the project stays public.
+
+        Both projects are owned by user2 and queried as user1 below, so the
+        asserted roles always come from the `public` origin, not ownership.
+        """
+        # Default `public_collaborator_role` is `reader`
+        project1 = Project.objects.create(
+            name="project1", is_public=True, owner=self.user2
+        )
+
+        self.assertEqual(
+            project1.public_collaborator_role, ProjectCollaboratorRole.READER
+        )
+
+        # A public project with a non-default `public_collaborator_role` grants that role
+        project2 = Project.objects.create(
+            name="project2",
+            is_public=True,
+            owner=self.user2,
+            public_collaborator_role=ProjectCollaboratorRole.EDITOR,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        def get_user_role(project):
+            response = self.client.get(f"/api/v1/projects/{project.pk}/", follow=True)
+            self.assertTrue(status.is_success(response.status_code))
+            return response.json()["user_role"]
+
+        self.assertEqual(get_user_role(project1), "reader")
+        self.assertEqual(get_user_role(project2), "editor")
+
+        # `public_collaborator_role` only takes effect while the project is public
+        project2.is_public = False
+        project2.save()
+
+        response = self.client.get(f"/api/v1/projects/{project2.pk}/", follow=True)
+        self.assertEqual(response.status_code, 403)
+
+        # Changing `public_collaborator_role` on an already-public project takes effect immediately
+        project2.is_public = True
+        project2.public_collaborator_role = ProjectCollaboratorRole.REPORTER
+        project2.save()
+
+        self.assertEqual(get_user_role(project2), "reporter")
+
+    def test_public_collaborator_role_rejects_privileged_roles(self):
+        """Test that `public_collaborator_role` must not allow granting `admin` and `manager` to everyone, since that role is handed out to any user once a project is public."""
+        for role in (ProjectCollaboratorRole.ADMIN, ProjectCollaboratorRole.MANAGER):
+            with self.subTest(role=role):
+                with self.assertRaises(ValidationError):
+                    Project.objects.create(
+                        name="project1",
+                        is_public=True,
+                        owner=self.user1,
+                        public_collaborator_role=role,
+                    )
+
+    def test_public_collaborator_role_via_api(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest("Test the API defaults `public_collaborator_role` to reader"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "project_default_role",
+                    "owner": "user1",
+                    "is_public": True,
+                },
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.json()["public_collaborator_role"], "reader")
+
+        with self.subTest("Test the API creates a project with the given role"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "project_editor_role",
+                    "owner": "user1",
+                    "is_public": True,
+                    "public_collaborator_role": "editor",
+                },
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.json()["public_collaborator_role"], "editor")
+            self.assertEqual(
+                Project.objects.get(
+                    name="project_editor_role"
+                ).public_collaborator_role,
+                ProjectCollaboratorRole.EDITOR,
+            )
+
+        project = Project.objects.get(name="project_editor_role")
+
+        with self.subTest("Test the API updates the role of an existing project"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "reporter"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["public_collaborator_role"], "reporter")
+
+            project.refresh_from_db()
+            self.assertEqual(
+                project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+            )
+
+        with self.subTest("Test the API rejects `admin` role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "admin"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        with self.subTest("Test the API rejects `manager` role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "manager"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        with self.subTest("Test the API rejects an unknown role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "superuser"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        project.refresh_from_db()
+        self.assertEqual(
+            project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+        )
+
+        with self.subTest("Test a non-admin user cannot change the role"):
+            self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "reader"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+            project.refresh_from_db()
+            self.assertEqual(
+                project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+            )
+
+    def test_private_project_memberships(self):
+        """Tests for QF-1553 - limit collaboration on private projects."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project with a collaborator
+        u = Person.objects.create(username="u")
+        o = Organization.objects.create(username="o", organization_owner=u)
+        p = Project.objects.create(name="p", owner=u, is_public=True)
+
+        subscription = set_subscription(
+            u, max_premium_collaborators_per_private_project=1
+        )
+
+        apiurl = f"/api/v1/projects/{p.pk}/"
+
+        self.client.raise_request_exception = True
+
+        def assertNoRole():  # noqa: N802
+            response = self.client.get(apiurl, follow=True)
+            self.assertEqual(response.status_code, 403)
+
+        def assertRole(role, origin):  # noqa: N802
+            response = self.client.get(apiurl, follow=True)
+            self.assertEqual(response.status_code, 200)
+            json = response.json()
+            self.assertEqual(json["user_role"], role)
+            self.assertEqual(json["user_role_origin"], origin)
+
+        # Project is public, we have a public role
+        assertRole("reader", "public")
+
+        # Project is public, collaboration membership is valid
+        ProjectCollaborator.objects.create(
+            project=p, collaborator=self.user1, role=ProjectCollaboratorRole.MANAGER
+        )
+        assertRole("manager", "collaborator")
+
+        # The project can go private while its collaborator count is within the plan limit
+        p.is_public = False
+        p.save()
+        assertRole("manager", "collaborator")
+
+        # Dropping the plan limit below the collaborator count invalidates the role
+        subscription.plan.max_premium_collaborators_per_private_project = 0
+        subscription.plan.save()
+        assertNoRole()
+
+        # Making the owner an organization is not enough as user is not member of that org
+        p.owner = o
+        p.save()
+        assertNoRole()
+
+        # As the user must be member of the organization
+        OrganizationMember.objects.create(organization=o, member=self.user1)
+        assertRole("manager", "collaborator")
+
+    def test_add_project_collaborator_without_being_org_member(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+
+        # cannot add project collaborator if not already an org member
+        with self.assertRaises(ValidationError):
+            ProjectCollaborator.objects.create(
+                project=p1,
+                collaborator=u2,
+                role=ProjectCollaboratorRole.MANAGER,
+            )
+
+    def test_direct_collaborators(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+
+        OrganizationMember.objects.create(organization=o1, member=u2)
+        c1 = ProjectCollaborator.objects.create(
+            project=p1,
+            collaborator=u2,
+            role=ProjectCollaboratorRole.MANAGER,
+            is_incognito=False,
+        )
+
+        self.assertEqual(len(p1.direct_collaborators), 1)
+
+        c1.is_incognito = True
+        c1.save()
+
+        self.assertEqual(len(p1.direct_collaborators), 0)
+
+    def test_exceeds_private_collaborator_limit(self):
+        """Test the behavior of exceeding the private collaborator limit for a project."""
+        o1 = Organization.objects.create(username="o1", organization_owner=self.user1)
+        OrganizationMember.objects.create(organization=o1, member=self.user2)
+        OrganizationMember.objects.create(organization=o1, member=self.user3)
+        set_subscription(o1, max_premium_collaborators_per_private_project=1)
+
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
+
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user2, role=ProjectCollaboratorRole.READER
+        )
+        # at the limit, not over it
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
+
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user3, role=ProjectCollaboratorRole.READER
+        )
+        # now over the limit
+        self.assertTrue(p1.exceeds_private_collaborator_limit)
+
+    def test_exceeds_private_collaborator_limit_unlimited_plan(self):
+        """Test the behavior of exceeding the private collaborator limit for a project when the plan allows unlimited collaborators."""
+        set_subscription(self.user1, max_premium_collaborators_per_private_project=-1)
+        p1 = Project.objects.create(name="p1", owner=self.user1, is_public=False)
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user2, role=ProjectCollaboratorRole.READER
+        )
+
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
+
+    def test_collaborators_count_no_collaborators(self):
+        # baseline: owner-only project counts 0
+        project = Project.objects.create(name="p", is_public=False, owner=self.user1)
+        self.assertEqual(project.total_collaborators_count, 0)
+
+    def test_total_collaborators_count_team_members_only(self):
+        o1 = Organization.objects.create(username="o1", organization_owner=self.user1)
+        t1 = Team.objects.create(username="@o1/t1", team_organization=o1)
+        OrganizationMember.objects.create(organization=o1, member=self.user2)
+        OrganizationMember.objects.create(organization=o1, member=self.user3)
+        TeamMember.objects.create(team=t1, member=self.user2)
+        TeamMember.objects.create(team=t1, member=self.user3)
+        project = Project.objects.create(name="p", is_public=False, owner=o1)
+        ProjectCollaborator.objects.create(
+            project=project, collaborator=t1, role=ProjectCollaboratorRole.REPORTER
+        )
+        self.assertEqual(project.total_collaborators_count, 2)
+
+    def test_total_collaborators_count_deduplicates_person_in_both(self):
+        # user2 is both a direct collaborator AND a team member
+        o1 = Organization.objects.create(username="o1", organization_owner=self.user1)
+        t1 = Team.objects.create(username="@o1/t1", team_organization=o1)
+        OrganizationMember.objects.create(organization=o1, member=self.user2)
+        OrganizationMember.objects.create(organization=o1, member=self.user3)
+        TeamMember.objects.create(team=t1, member=self.user2)
+        TeamMember.objects.create(team=t1, member=self.user3)
+        project = Project.objects.create(name="p", is_public=False, owner=o1)
+        ProjectCollaborator.objects.create(
+            project=project,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.MANAGER,
+        )
+        ProjectCollaborator.objects.create(
+            project=project, collaborator=t1, role=ProjectCollaboratorRole.REPORTER
+        )
+        self.assertEqual(project.total_collaborators_count, 2)  # user2, user3
+
+    def test_total_collaborators_count_excludes_org_owner_in_team(self):
+        # org owner (user1) is a team member and must NOT be counted
+        o1 = Organization.objects.create(username="o1", organization_owner=self.user1)
+        t1 = Team.objects.create(username="@o1/t1", team_organization=o1)
+        TeamMember.objects.create(team=t1, member=self.user1)
+        OrganizationMember.objects.create(organization=o1, member=self.user2)
+        TeamMember.objects.create(team=t1, member=self.user2)
+        project = Project.objects.create(name="p", is_public=False, owner=o1)
+        ProjectCollaborator.objects.create(
+            project=project, collaborator=t1, role=ProjectCollaboratorRole.REPORTER
+        )
+        self.assertEqual(project.total_collaborators_count, 1)  # only user2, not user1
+
+    def test_add_project_collaborator_and_being_org_member(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+
+        # add project collaborator if the user is already an organization member
+        OrganizationMember.objects.create(organization=o1, member=u2)
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=u2, role=ProjectCollaboratorRole.MANAGER
+        )
+
+    def test_add_team_member_without_being_org_member(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        t1 = Team.objects.create(username="t1", team_organization=o1)
+
+        # cannot add team member if not already an org members
+        with self.assertRaises(ValidationError):
+            TeamMember.objects.create(team=t1, member=u2)
+
+    def test_add_team_member_and_being_org_member(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        t1 = Team.objects.create(username="t1", team_organization=o1)
+
+        # add team member if not already an org members
+        OrganizationMember.objects.create(organization=o1, member=u2)
+        TeamMember.objects.create(team=t1, member=u2)
+
+    def test_delete_org_member_should_delete_team_membership(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        t1 = Team.objects.create(username="t1", team_organization=o1)
+
+        # deleting an organization member via queryset should also delete team membership
+        OrganizationMember.objects.create(organization=o1, member=u2)
+        TeamMember.objects.create(team=t1, member=u2)
+
+        self.assertEqual(TeamMember.objects.filter(team=t1, member=u2).count(), 1)
+
+        OrganizationMember.objects.filter(organization=o1, member=u2).delete()
+
+        self.assertEqual(TeamMember.objects.filter(team=t1, member=u2).count(), 0)
+
+        # deleting an organization member via model should also delete team membership
+        om1 = OrganizationMember.objects.create(organization=o1, member=u2)
+        TeamMember.objects.create(team=t1, member=u2)
+
+        self.assertEqual(TeamMember.objects.filter(team=t1, member=u2).count(), 1)
+
+        om1.delete()
+
+        self.assertEqual(TeamMember.objects.filter(team=t1, member=u2).count(), 0)
+
+    def test_create_project_by_inactive_user(self):
+        p1 = Project.objects.create(
+            name="p1",
+            owner=self.user1,
+        )
+
+        subscription = self.user1.useraccount.current_subscription
+        subscription.status = Subscription.Status.INACTIVE_DRAFT
+        subscription.save()
+
+        # Make sure the user is inactive
+        self.assertFalse(self.user1.useraccount.current_subscription.is_active)
+
+        # Can create project if user's subscription is inactive
+        Project.objects.create(
+            name="p2",
+            owner=self.user1,
+        )
+
+        # Can still modify existing project
+        p1.name = "p1-modified"
+        p1.save()
+
+    def test_create_project_if_user_is_over_quota(self):
+        plan = self.user1.useraccount.current_subscription.plan
+
+        # Create a project that uses all the storage
+        more_bytes_than_plan = (plan.storage_mb * 1000 * 1000) + 1
+        p1 = Project.objects.create(
+            name="p1",
+            owner=self.user1,
+            file_storage_bytes=more_bytes_than_plan,
+        )
+
+        # Can create another project if the user's plan is over quota
+        Project.objects.create(
+            name="p2",
+            owner=self.user1,
+        )
+
+        # Can still modify existing project
+        p1.name = "p1-modified"
+        p1.save()
+
+    def test_localized_layers_property(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(name="project_with_layers", owner=self.user1)
+
+        # Fake the property manually for testing purpose
+        project._localized_layers = [{"filename": "localized:layer1.tif"}]
+
+        with patch(
+            "qfieldcloud.project.models.Project.localized_layers",
+            new_callable=lambda: property(lambda self: self._localized_layers),
+        ):
+            layers = project.localized_layers
+            self.assertEqual(len(layers), 1)
+            self.assertEqual(layers[0]["filename"], "localized:layer1.tif")
+
+    def test_project_serializer_shared_datasets_project_id(self):
+        """Test that ProjectSerializer returns the correct shared_datasets_project_id."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(name="project", owner=self.user1)
+        localized_project = Project.objects.create(
+            name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1
+        )
+
+        response = self.client.get(f"/api/v1/projects/{project.id}/")
+
+        self.assertEqual(response.status_code, 200)
+
+        json = response.json()
+
+        self.assertEqual(json["shared_datasets_project_id"], str(localized_project.id))
+
+    def test_project_serializer_is_shared_datasets_project(self):
+        """Test that ProjectSerializer returns is_shared_datasets_project correctly."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(name="project", owner=self.user1)
+        localized_project = Project.objects.create(
+            name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1
+        )
+
+        response = self.client.get(f"/api/v1/projects/{project.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["is_shared_datasets_project"])
+
+        response = self.client.get(f"/api/v1/projects/{localized_project.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_shared_datasets_project"])
+
+    def test_get_shared_datasets_project_exists(self):
+        """Test Project.shared_datasets_project returns the project if found."""
+        project = Project.objects.create(name="project", owner=self.user1)
+        localized_project = Project.objects.create(
+            name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1
+        )
+
+        self.assertIsNotNone(project.shared_datasets_project)
+        self.assertEqual(project.shared_datasets_project.id, localized_project.id)
+
+    def test_get_shared_datasets_project_missing(self):
+        """Test Project.shared_datasets_project returns None if not found."""
+        project = Project.objects.create(name="project", owner=self.user1)
+
+        self.assertIsNone(project.shared_datasets_project)
+
+    def test_get_missing_localized_layers_when_no_localized_project(self):
+        """Test get_missing_localized_layers returns all localized layers if no shared datasets project exists."""
+        project = Project.objects.create(name="project", owner=self.user1)
+
+        file_version = FileVersion.objects.add_version(
+            project=project,
+            filename="project.qgs",
+            content=ContentFile(b"", "project.qgs"),
+            file_type=File.FileType.PROJECT_FILE,
+            uploaded_by=self.user1,
+        )
+
+        qgis_project = QgisProject.objects.create(
+            project=project, file_version=file_version, crs="EPSG:3857"
+        )
+        QgisLayer.objects.create(
+            qgis_project=qgis_project,
+            qgis_layer_id="layer1",
+            name="layer1",
+            crs="EPSG:3857",
+            geom_type=QgsGeometryType.Point,
+            layer_type=QgsLayerType.Vector,
+            datasource="",
+            is_localized=True,
+            file_name="localized:layer1.gpkg",
+            ordering=0,
+        )
+        QgisLayer.objects.create(
+            qgis_project=qgis_project,
+            qgis_layer_id="layer2",
+            name="layer2",
+            crs="EPSG:3857",
+            geom_type=QgsGeometryType.Point,
+            layer_type=QgsLayerType.Vector,
+            datasource="",
+            is_localized=False,
+            file_name="normal_layer.gpkg",
+            ordering=1,
+        )
+        QgisLayer.objects.create(
+            qgis_project=qgis_project,
+            qgis_layer_id="layer3",
+            name="layer3",
+            crs="EPSG:3857",
+            geom_type=QgsGeometryType.Point,
+            layer_type=QgsLayerType.Vector,
+            datasource="",
+            is_localized=True,
+            file_name="localized:layer3.gpkg",
+            ordering=2,
+        )
+
+        missing_layers = project.get_missing_localized_layers()
+        missing_filenames = []
+        for layer in missing_layers:
+            missing_filenames.append(layer.file_name)
+
+        self.assertEqual(len(missing_filenames), 2)
+        self.assertIn("localized:layer1.gpkg", missing_filenames)
+        self.assertIn("localized:layer3.gpkg", missing_filenames)
+
+    def test_get_some_missing_localized_layers(self):
+        """Test that get_missing_localized_layers returns multiple missing layers."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(
+            name="project_get_some_missing", owner=self.user1
+        )
+
+        missing_layers_mock = [
+            {"filename": "localized:missing_layer1.tif"},
+            {"filename": "localized:missing_layer2.tif"},
+        ]
+
+        with patch.object(
+            Project,
+            "get_missing_localized_layers",
+            return_value=missing_layers_mock,
+        ):
+            missing_layers = project.get_missing_localized_layers()
+
+            self.assertEqual(len(missing_layers), 2)
+            self.assertEqual(
+                missing_layers[0]["filename"], "localized:missing_layer1.tif"
+            )
+            self.assertEqual(
+                missing_layers[1]["filename"], "localized:missing_layer2.tif"
+            )
+
+    def test_get_no_missing_localized_layers(self):
+        """Test that get_missing_localized_layers returns an empty list when no missing layers."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(
+            name="project_get_no_missing", owner=self.user1
+        )
+
+        with patch.object(
+            Project,
+            "get_missing_localized_layers",
+            return_value=[],
+        ):
+            missing_layers = project.get_missing_localized_layers()
+
+            self.assertEqual(missing_layers, [])
+            self.assertEqual(len(missing_layers), 0)
+
+    def test_get_missing_localized_layers_method(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        project = Project.objects.create(name="project_get_missing", owner=self.user1)
+
+        with patch.object(
+            Project,
+            "get_missing_localized_layers",
+            return_value=[{"filename": "localized:missing_layer.tif"}],
+        ):
+            missing_layers = project.get_missing_localized_layers()
+
+            self.assertEqual(len(missing_layers), 1)
+            self.assertEqual(
+                missing_layers[0]["filename"], "localized:missing_layer.tif"
+            )
+
+    def test_get_project_details_for_qfield(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        _project = Project.objects.create(name="project_to_repackage", owner=self.user1)
+
+        response = self.client.get("/api/v1/projects/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        payload = response.json()
+
+        self.assertEqual(len(payload), 1)
+
+        project_json = payload[0]
+
+        self.assertIn("name", project_json)
+        self.assertIsInstance(project_json["name"], str)
+        self.assertIn("owner", project_json)
+        self.assertIsInstance(project_json["owner"], str)
+        self.assertIn("description", project_json)
+        self.assertIsInstance(project_json["description"], str)
+        self.assertIn("user_role", project_json)
+        self.assertIsInstance(project_json["user_role"], str)
+        self.assertIn("is_public", project_json)
+        self.assertIsInstance(project_json["is_public"], bool)
+        self.assertIn("can_repackage", project_json)
+        self.assertIsInstance(project_json["can_repackage"], bool)
+        self.assertIn("needs_repackaging", project_json)
+        self.assertIsInstance(project_json["needs_repackaging"], bool)
+
+    def test_seamless_projects_fetching_with_public_ones(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # user1's projects
+        Project.objects.create(name="private_project_of_user1", owner=self.user1)
+        Project.objects.create(
+            name="public_project_of_user1", owner=self.user1, is_public=True
+        )
+
+        # user2's projects
+        Project.objects.create(name="private_project_of_user2", owner=self.user2)
+        Project.objects.create(
+            name="public_project_of_user2", owner=self.user2, is_public=True
+        )
+
+        # organization1's project
+        org1 = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        Project.objects.create(name="private_project_of_org1", owner=org1)
+        Project.objects.create(
+            name="public_project_of_org1", owner=org1, is_public=True
+        )
+
+        # organization2's project
+        org2 = Organization.objects.create(
+            username="org2", organization_owner=self.user2
+        )
+        Project.objects.create(name="private_project_of_org2", owner=org2)
+        Project.objects.create(
+            name="public_project_of_org2", owner=org2, is_public=True
+        )
+
+        data = self.client.get(
+            "/api/v1/projects/",
+        ).json()
+
+        self.assertEqual(len(data), 4)
+
+        self.assertEqual(data[0]["owner"], "org1")
+        self.assertEqual(data[0]["name"], "private_project_of_org1")
+        self.assertFalse(data[0]["is_public"])
+
+        self.assertEqual(data[1]["owner"], "org1")
+        self.assertEqual(data[1]["name"], "public_project_of_org1")
+        self.assertTrue(data[1]["is_public"])
+
+        self.assertEqual(data[2]["owner"], "user1")
+        self.assertEqual(data[2]["name"], "private_project_of_user1")
+        self.assertFalse(data[2]["is_public"])
+
+        self.assertEqual(data[3]["owner"], "user1")
+        self.assertEqual(data[3]["name"], "public_project_of_user1")
+        self.assertTrue(data[3]["is_public"])
+
+    def test_restricted_data_last_updated_at_on_file_upload(self):
+        """Test that restricted_data_last_updated_at is updated when restricted files are uploaded."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project
+        project = Project.objects.create(name="test_restricted_data", owner=self.user1)
+
+        # Upload a non-restricted file (e.g. a `csv` file)
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/data.csv/",
+            {"file": StringIO("c1,c2\r\nv1,v2")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        # Initially, `restricted_data_last_updated_at` should be None
+        self.assertIsNone(project.restricted_data_last_updated_at)
+
+        # Upload a QGIS project file (restricted file)
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qgs/",
+            {"file": io.FileIO(testdata_path("simple_bumblebees.qgs"), "rb")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project.refresh_from_db()
+        # After uploading a restricted file, `restricted_data_last_updated_at` should be set
+        self.assertIsNotNone(project.restricted_data_last_updated_at)
+        first_update_time = project.restricted_data_last_updated_at
+
+        # Upload a non-restricted file (e.g. a `csv` file)
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/data.csv/",
+            {"file": StringIO("c1,c2\r\nv1,v2")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project.refresh_from_db()
+        # After uploading a non-restricted file, `restricted_data_last_updated_at` should NOT change
+        self.assertEqual(project.restricted_data_last_updated_at, first_update_time)
+
+        # Upload another restricted file (e.g. `.qml` file)
+        time.sleep(0.01)
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qml/",
+            {"file": StringIO("import QtQuick")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project.refresh_from_db()
+        # After uploading another restricted file, `restricted_data_last_updated_at` should be updated
+        self.assertIsNotNone(project.restricted_data_last_updated_at)
+        self.assertGreater(project.restricted_data_last_updated_at, first_update_time)
+
+    def test_restricted_data_last_updated_at_on_file_delete(self):
+        """Test that restricted_data_last_updated_at is updated when restricted files are deleted."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project
+        project = Project.objects.create(
+            name="test_restricted_data_delete", is_public=False, owner=self.user1
+        )
+
+        # Upload restricted file (e.g. `.qgs` file)
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qgs/",
+            {"file": io.FileIO(testdata_path("simple_bumblebees.qgs"), "rb")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project.refresh_from_db()
+        first_update_time = project.restricted_data_last_updated_at
+        self.assertIsNotNone(first_update_time)
+
+        # Wait a bit to ensure timestamp difference
+        time.sleep(0.01)
+
+        # Delete the restricted file
+        response = self.client.delete(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qgs/"
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project.refresh_from_db()
+        # After deleting a restricted file, `restricted_data_last_updated_at` should be updated
+        self.assertIsNotNone(project.restricted_data_last_updated_at)
+        self.assertGreater(project.restricted_data_last_updated_at, first_update_time)
+
+    def test_rename_qgis_contain_file_to_shared_datasets_project(self):
+        """Test that renaming a project with a QGIS file to 'shared_datasets' is not allowed."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project
+        project = Project.objects.create(
+            name="test_rename_qgis_project", owner=self.user1
+        )
+
+        # Upload a QGIS project file
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qgs/",
+            {"file": io.FileIO(testdata_path("simple_bumblebees.qgs"), "rb")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        # Try to rename the project to 'shared_datasets'
+        response = self.client.patch(
+            f"/api/v1/projects/{project.id}/",
+            {"name": SHARED_DATASETS_PROJECT_NAME},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_upload_qgis_project_file_to_shared_datasets_project(self):
+        """Test that uploading a QGIS project file to a 'shared_datasets' project is not allowed."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a 'shared_datasets' project
+        project = Project.objects.create(
+            name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1
+        )
+
+        # Try to upload a QGIS project file
+        response = self.client.post(
+            f"/api/v1/files/{project.id}/simple_bumblebees.qgs/",
+            {"file": io.FileIO(testdata_path("simple_bumblebees.qgs"), "rb")},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_upload_project_thumbnail(self):
+        """Test that uploading a thumbnail to a project is successful."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project
+        project = Project.objects.create(name="test_upload_thumbnail", owner=self.user1)
+
+        self.assertIsNone(project.thumbnail.name)
+
+        # Upload a thumbnail
+        response = self.client.post(
+            f"/api/v1/projects/{project.id}/thumbnail/",
+            {"thumbnail": io.FileIO(testdata_path("DCIM/1.jpg"), "rb")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Check that the thumbnail is set on the project
+        project.refresh_from_db()
+        self.assertIsNotNone(project.thumbnail)
+
+    def test_upload_project_thumbnail_invalid_file(self):
+        """Test that uploading a thumbnail with an invalid file type is not allowed."""
+        from PIL import Image
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # Create a project
+        project = Project.objects.create(name="test_upload_thumbnail", owner=self.user1)
+
+        # Test 1: Upload a thumbnail with an invalid file extension
+
+        response = self.client.post(
+            f"/api/v1/projects/{project.id}/thumbnail/",
+            {"thumbnail": io.FileIO(testdata_path("simple_bumblebees.qgs"), "rb")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Test 2: Upload a fake image file (text file renamed to .png)
+        fake_image = io.BytesIO(
+            b"This is not an image, just text pretending to be one!"
+        )
+        fake_image.name = "fake.png"
+
+        response = self.client.post(
+            f"/api/v1/projects/{project.id}/thumbnail/",
+            {"thumbnail": fake_image},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Test 3: Upload a thumbnail with invalid file size (>5MB)
+        large_image = Image.new("RGB", (3000, 3000), color="red")
+        large_file = io.BytesIO()
+        large_image.save(large_file, format="PNG", compress_level=0)
+        large_file.seek(0)
+        large_file.name = "large.png"
+
+        response = self.client.post(
+            f"/api/v1/projects/{project.id}/thumbnail/",
+            {"thumbnail": large_file},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Test 4: Upload a thumbnail with invalid dimensions (>10000x10000)
+        huge_image = Image.new("RGB", (10001, 10001), color="blue")
+        huge_file = io.BytesIO()
+        huge_image.save(huge_file, format="PNG")
+        huge_file.seek(0)
+        huge_file.name = "huge.png"
+
+        response = self.client.post(
+            f"/api/v1/projects/{project.id}/thumbnail/",
+            {"thumbnail": huge_file},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_upload_project_thumbnail_permissions(self):
+        """Test upload thumbnails permissions."""
+        # Create a private project owned by user1
+        project = Project.objects.create(
+            name="perm_test_project", owner=self.user1, is_public=False
+        )
+
+        # Un authorized roles that are forbidden to upload a thumbnail
+        unauthorized_roles = [
+            ProjectCollaboratorRole.READER,
+        ]
+
+        for role in ProjectCollaboratorRole:
+            collaborator_user = Person.objects.create_user(
+                username=f"user_{role}", password="abc123"
+            )
+            collaborator_token = AuthToken.objects.create(user=collaborator_user)
+            ProjectCollaborator.objects.create(
+                project=project, collaborator=collaborator_user, role=role
+            )
+
+            self.client.credentials(
+                HTTP_AUTHORIZATION="Token " + collaborator_token.key
+            )
+
+            with open(testdata_path("DCIM/1.jpg"), "rb") as thumbnail_file:
+                response = self.client.post(
+                    f"/api/v1/projects/{project.id}/thumbnail/",
+                    {"thumbnail": thumbnail_file},
+                    format="multipart",
+                )
+
+            if role in unauthorized_roles:
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+                continue
+
+            self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Check that a user with no role on a PRIVATE project is forbidden
+        other_user = Person.objects.create_user(
+            username="no_role_user", password="abc123"
+        )
+        other_token = AuthToken.objects.create(user=other_user)
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + other_token.key)
+
+        with open(testdata_path("DCIM/1.jpg"), "rb") as thumbnail_file:
+            response = self.client.post(
+                f"/api/v1/projects/{project.id}/thumbnail/",
+                {"thumbnail": thumbnail_file},
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Check that a user with no role on a PUBLIC project is forbidden
+        project.is_public = True
+        project.save()
+
+        with open(testdata_path("DCIM/1.jpg"), "rb") as thumbnail_file:
+            response = self.client.post(
+                f"/api/v1/projects/{project.id}/thumbnail/",
+                {"thumbnail": thumbnail_file},
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_clone_project(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self._create_clonable_project()
+        # A non-default role, so the clone can only match it by copying it
+        project.public_collaborator_role = ProjectCollaboratorRole.REPORTER
+        project.save()
+
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "cloned_project",
+                "owner": self.user1.username,
+                "clone_from_project": str(project.id),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(response.json().get("id"))
+
+        cloned_project = Project.objects.get(pk=response.json().get("id"))
+        clone_seed = ProjectSeed.objects.get(project=cloned_project)
+        self.assertEqual(cloned_project.owner, self.user1)
+        self.assertEqual(cloned_project.is_public, project.is_public)
+        self.assertEqual(
+            cloned_project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+        )
+        self.assertEqual(
+            cloned_project.overwrite_conflicts, project.overwrite_conflicts
+        )
+        self.assertEqual(
+            cloned_project.has_restricted_projectfiles,
+            project.has_restricted_projectfiles,
+        )
+        self.assertEqual(
+            cloned_project.is_attachment_download_on_demand,
+            project.is_attachment_download_on_demand,
+        )
+        self.assertEqual(clone_seed.clone_from_project, project)
+        self.assertIsNone(clone_seed.extent)
+
+        self.assertTrue(
+            Job.objects.filter(
+                project=cloned_project, type=Job.Type.CREATE_PROJECT
+            ).exists()
+        )
+
+    def test_clone_project_seed_extent(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self._create_clonable_project()
+
+        # Clone with a seed extent
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "cloned_project_with_extent",
+                "owner": self.user1.username,
+                "clone_from_project": str(project.id),
+                "seed": {"extent": "22,41,29,45.67"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(response.json().get("id"))
+
+        cloned_project_with_extent = Project.objects.get(pk=response.json().get("id"))
+        seed_with_extent = ProjectSeed.objects.get(project=cloned_project_with_extent)
+        self.assertEqual(seed_with_extent.clone_from_project, project)
+        self.assertIsNotNone(seed_with_extent.extent)
+
+        # Providing seed with extra fields beyond "extent" is not allowed when cloning
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "invalid_seed_clone",
+                "owner": self.user1.username,
+                "clone_from_project": str(project.id),
+                "seed": {"extent": "22,41,29,45.67", "basemap_provider": "osm"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Providing seed without an extent is not allowed when cloning
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "no_extent_clone",
+                "owner": self.user1.username,
+                "clone_from_project": str(project.id),
+                "seed": {"basemap_provider": "osm"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_clone_project_invalid_requests(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self._create_clonable_project()
+
+        # Cloning with the same name as an existing project is not allowed
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": project.name,
+                "owner": project.owner.username,
+                "clone_from_project": str(project.id),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "project_already_exists")
+
+        # Cloning a shared datasets project is not allowed
+        shared_project = Project.objects.create(
+            name=SHARED_DATASETS_PROJECT_NAME,
+            owner=self.user1,
+        )
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "cloned_shared_datasets",
+                "owner": self.user1.username,
+                "clone_from_project": str(shared_project.id),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Cloning a non-existent project returns 404
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "clone_of_nonexistent",
+                "owner": self.user1.username,
+                "clone_from_project": "00000000-0000-0000-0000-000000000000",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_cloning_by_project_type(self):
+        """Test which project types are allowed to be cloned: `REGULAR` and `TEMPLATE` are allowed, `SHARED_DATASETS` is not allowed."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        def clone_project(source_project):
+            return self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": f"cloned_{source_project.name}",
+                    "owner": self.user1.username,
+                    "clone_from_project": str(source_project.id),
+                },
+                format="json",
+            )
+
+        with self.subTest("Prjects of type `REGULAR` can be cloned"):
+            regular_project = Project.objects.create(
+                name="regular_project", owner=self.user1
+            )
+            response = clone_project(regular_project)
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            cloned_project_id = response.json().get("id")
+            self.assertTrue(Project.objects.filter(pk=cloned_project_id).exists())
+            cloned_project = Project.objects.get(pk=cloned_project_id)
+            self.assertTrue(
+                Job.objects.filter(
+                    project=cloned_project, type=Job.Type.CREATE_PROJECT
+                ).exists()
+            )
+
+        with self.subTest("Projects of type `TEMPLATE` can be cloned"):
+            template_project = Project.objects.create(
+                name="template_project",
+                owner=self.user1,
+                project_type=Project.ProjectType.TEMPLATE,
+            )
+            response = clone_project(template_project)
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            cloned_project_id = response.json().get("id")
+            self.assertTrue(Project.objects.filter(pk=cloned_project_id).exists())
+            cloned_project = Project.objects.get(pk=cloned_project_id)
+            self.assertTrue(
+                Job.objects.filter(
+                    project=cloned_project, type=Job.Type.CREATE_PROJECT
+                ).exists()
+            )
+
+        with self.subTest("Projects of type `SHARED_DATASETS` cannot be cloned"):
+            shared_project = Project.objects.create(
+                name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1
+            )
+            response = clone_project(shared_project)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.data["code"], "not_cloneable_project")
+            self.assertFalse(
+                Project.objects.filter(name=f"cloned_{shared_project.name}").exists()
+            )
+
+    def test_create_project_sets_created_by(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        response = self.client.post(
+            "/api/v1/projects/",
+            {
+                "name": "created_by_project",
+                "owner": "user1",
+                "is_public": False,
+            },
+        )
+        self.assertTrue(status.is_success(response.status_code))
+
+        project = Project.objects.get(name="created_by_project")
+        self.assertEqual(project.created_by, self.user1)
+
+    def test_create_organization_project_admin_access(self):
+        def add_organization_member(organization, member, role):
+            OrganizationMember.objects.create(
+                organization=organization,
+                member=member,
+                role=role,
+            )
+            return AuthToken.objects.get_or_create(user=member)[0]
+
+        def create_organization_project(token, project_name, owner_username):
+            self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+            return self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": project_name,
+                    "owner": owner_username,
+                    "is_public": False,
+                },
+            )
+
+        # user1 owns organization1
+        organization1 = Organization.objects.create(
+            username="organization1", organization_owner=self.user1
+        )
+
+        with self.subTest("`CREATOR` role gets implicit admin access to the project"):
+            token = add_organization_member(
+                organization1, self.user2, OrganizationMember.Roles.CREATOR
+            )
+            response = create_organization_project(
+                token, "creator_project", "organization1"
+            )
+            self.assertTrue(status.is_success(response.status_code))
+
+            project = Project.objects.get(name="creator_project")
+            collaborator = ProjectCollaborator.objects.get(
+                project=project, collaborator=self.user2
+            )
+            self.assertEqual(collaborator.role, ProjectCollaboratorRole.ADMIN)
+
+        with self.subTest(
+            "`organization_owner` gets implicit admin access to the project"
+        ):
+            response = create_organization_project(
+                self.token1, "owner_project", "organization1"
+            )
+            self.assertTrue(status.is_success(response.status_code))
+
+            project = Project.objects.get(name="owner_project")
+            # the owner already gets implicit admin access, no extra grant needed
+            self.assertFalse(
+                ProjectCollaborator.objects.filter(
+                    project=project, collaborator=self.user1
+                ).exists()
+            )
+
+        with self.subTest("`ADMIN` role gets implicit admin access to the project"):
+            token = add_organization_member(
+                organization1, self.user3, OrganizationMember.Roles.ADMIN
+            )
+            response = create_organization_project(
+                token, "admin_project", "organization1"
+            )
+            self.assertTrue(status.is_success(response.status_code))
+
+            project = Project.objects.get(name="admin_project")
+            # `ADMIN` members already get implicit admin access via
+            # `projects_with_roles_vw`, no extra grant needed
+            self.assertFalse(
+                ProjectCollaborator.objects.filter(
+                    project=project, collaborator=self.user3
+                ).exists()
+            )
+
+    def test_project_teams_field(self):
+        """`GET /projects/<id>/` returns `teams`, the caller's team names in the project's owning organization."""
+        # org1 has three teams. Nobody joins gamma.
+        org1 = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        team_alpha = Team.objects.create(username="@org1/alpha", team_organization=org1)
+        team_beta = Team.objects.create(username="@org1/beta", team_organization=org1)
+        Team.objects.create(username="@org1/gamma", team_organization=org1)
+
+        # A second org with its own team, to check teams don't leak across orgs.
+        org2 = Organization.objects.create(
+            username="org2", organization_owner=self.user3
+        )
+        team_delta = Team.objects.create(username="@org2/delta", team_organization=org2)
+
+        # user2 is in team alpha and beta (org1), and in delta (org2).
+        OrganizationMember.objects.create(organization=org1, member=self.user2)
+        TeamMember.objects.create(team=team_alpha, member=self.user2)
+        TeamMember.objects.create(team=team_beta, member=self.user2)
+        OrganizationMember.objects.create(organization=org2, member=self.user2)
+        TeamMember.objects.create(team=team_delta, member=self.user2)
+
+        # user3 is an org1 admin but joins no team.
+        OrganizationMember.objects.create(
+            organization=org1, member=self.user3, role=OrganizationMember.Roles.ADMIN
+        )
+
+        # outsider has nothing to do with org1.
+        outsider = Person.objects.create_user(username="outsider", password="abc123")
+        outsider_token = AuthToken.objects.get_or_create(user=outsider)[0]
+
+        org_project = Project.objects.create(
+            name="org_project", is_public=True, owner=org1
+        )
+        person_project = Project.objects.create(
+            name="person_project", is_public=True, owner=self.user1
+        )
+        org_url = f"/api/v1/projects/{org_project.pk}/"
+
+        def get_teams(token, url):
+            self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+            response = self.client.get(url, follow=True)
+            self.assertTrue(status.is_success(response.status_code))
+            return response.json()["teams"]
+
+        # `teams` is the caller's teams in the owning organization unprefixed.
+        with self.subTest(
+            "Test an organization member of alpha and beta returns the correct teams"
+        ):
+            self.assertEqual(get_teams(self.token2, org_url), ["alpha", "beta"])
+
+        with self.subTest(
+            "Test an organization owner without a team returns empty teams"
+        ):
+            self.assertEqual(get_teams(self.token1, org_url), [])
+
+        with self.subTest(
+            "Test an organization admin without a team returns empty teams"
+        ):
+            self.assertEqual(get_teams(self.token3, org_url), [])
+
+        with self.subTest("Test an outsider on a public project returns empty teams"):
+            self.assertEqual(get_teams(outsider_token, org_url), [])
+
+        with self.subTest("Test a person-owned project returns empty teams"):
+            person_url = f"/api/v1/projects/{person_project.pk}/"
+            self.assertEqual(get_teams(self.token1, person_url), [])
+
+        # `teams` is not part of the list or write responses.
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest(
+            "Test that `teams` is not included in every project in the list response"
+        ):
+            response = self.client.get("/api/v1/projects/")
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertGreaterEqual(len(response.json()), 1)
+            for project_data in response.json():
+                self.assertNotIn("teams", project_data)
+
+        with self.subTest("Test that `teams` is not included from the create response"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "created_project",
+                    "owner": "org1",
+                    "description": "desc",
+                    "is_public": False,
+                },
+            )
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertNotIn("teams", response.json())
+
+        with self.subTest("Test that `teams` is not included in the update response"):
+            response = self.client.patch(org_url, {"description": "new desc"})
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertNotIn("teams", response.json())
+
+    def test_project_name_is_unique_case_insensitive_per_owner(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        Project.objects.create(name="survey", owner=self.user1)
+        Project.objects.create(name="plan", owner=self.user2)
+        project = Project.objects.create(name="other", owner=self.user1)
+        project_url = f"/api/v1/projects/{project.id}/"
+
+        def get_user1_project_names() -> list[str]:
+            return sorted(
+                Project.objects.filter(owner=self.user1).values_list("name", flat=True)
+            )
+
+        with self.subTest(
+            "Test the API rejects creating a project with a name in another case"
+        ):
+            response = self.client.post(
+                "/api/v1/projects/", {"name": "Survey", "owner": "user1"}
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.json()["code"], "project_already_exists")
+            self.assertEqual(get_user1_project_names(), ["other", "survey"])
+
+        with self.subTest(
+            "Test the API rejects renaming a project to a name in another case"
+        ):
+            response = self.client.patch(project_url, {"name": "SURVEY"})
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.json()["code"], "project_already_exists")
+            self.assertEqual(get_user1_project_names(), ["other", "survey"])
+
+        with self.subTest("Test the API creates a project named like another owner's"):
+            response = self.client.post(
+                "/api/v1/projects/", {"name": "Plan", "owner": "user1"}
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.json()["name"], "Plan")
+
+        with self.subTest(
+            "Test the API renames a project to its own name in another case"
+        ):
+            response = self.client.patch(project_url, {"name": "Other"})
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["name"], "Other")
+
+        with self.subTest(
+            "Test the API updates a project resubmitting its unchanged name"
+        ):
+            response = self.client.patch(
+                project_url, {"name": "Other", "description": "new description"}
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["description"], "new description")
+
+    def test_transfer_project_rejects_owner_with_name_differing_only_by_case(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        organization = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        Project.objects.create(name="survey", owner=organization)
+        project = Project.objects.create(name="Survey", owner=self.user1)
+
+        response = self.client.patch(
+            f"/api/v1/projects/{project.id}/", {"owner": "org1"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "project_already_exists")
+        project.refresh_from_db(fields=["owner"])
+        self.assertEqual(project.owner_id, self.user1.id)
+
+    def test_owner_can_transfer_project_to_own_organization(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        organization = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        project = Project.objects.create(name="survey", owner=self.user1)
+
+        response = self.client.patch(
+            f"/api/v1/projects/{project.id}/", {"owner": organization.username}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        project.refresh_from_db(fields=["owner"])
+        self.assertEqual(project.owner_id, organization.id)
+
+    def test_owner_cannot_transfer_project_to_another_person(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = Project.objects.create(name="survey", owner=self.user1)
+
+        response = self.client.patch(
+            f"/api/v1/projects/{project.id}/", {"owner": self.user2.username}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db(fields=["owner"])
+        self.assertEqual(project.owner_id, self.user1.id)
+
+    def test_manager_cannot_transfer_organization_project(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+        organization = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        OrganizationMember.objects.create(organization=organization, member=self.user2)
+        project = Project.objects.create(name="survey", owner=organization)
+        ProjectCollaborator.objects.create(
+            project=project,
+            collaborator=self.user2,
+            role=ProjectCollaboratorRole.MANAGER,
+        )
+
+        response = self.client.patch(
+            f"/api/v1/projects/{project.id}/", {"owner": self.user2.username}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db(fields=["owner"])
+        self.assertEqual(project.owner_id, organization.id)
+
+    def test_database_rejects_name_differing_only_by_case(self):
+        Project.objects.create(name="survey", owner=self.user1)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Project.objects.create(name="SURVEY", owner=self.user1)
+
+    @override_settings(ROOT_URLCONF="qfieldcloud.urls")
+    def test_admin_redirect_finds_project_by_name_differing_only_by_case(self):
+        project = Project.objects.create(name="survey", owner=self.user1)
+
+        response = self.client.get("/a/user1/SURVEY/")
+
+        self.assertRedirects(
+            response,
+            f"/admin/project/project/{project.id}/change/",
+            fetch_redirect_response=False,
+        )

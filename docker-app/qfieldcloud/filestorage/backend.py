@@ -1,0 +1,346 @@
+import base64
+import contextlib
+import mimetypes
+import os
+from abc import ABC
+from typing import Any
+from urllib.parse import quote
+
+import requests
+from django.core.exceptions import ImproperlyConfigured
+from django.core.files.base import ContentFile
+from django.core.files.storage import Storage
+from django.http import HttpResponse
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPBasicAuth
+from storages.backends.s3 import S3Storage
+from urllib3.util.retry import Retry
+
+from qfieldcloud.filestorage.constants import VERSION_SUFFIX_REGEX
+
+
+class QfcBackendStorageMixin(ABC):
+    def check_status(self) -> bool:
+        """Checks if the storage is reachable.
+
+        Returns:
+            True if reachable, False if not.
+        """
+        raise NotImplementedError(
+            "Subclassing QFC specific storages must implement this method."
+        )
+
+    def patch_nginx_download_redirect(self, response: HttpResponse) -> None:
+        """Patches a nginx redirect response for usage with the storage backend. At the moment, does nothing.
+
+        Arguments:
+            response: HTTP redirect response to patch.
+        """
+        pass
+
+
+class QfcS3Boto3Storage(QfcBackendStorageMixin, S3Storage):
+    def check_status(self) -> bool:
+        """Checks if the S3 bucket is reachable.
+
+        Returns:
+            True if reachable, False if not.
+        """
+        try:
+            bucket_name = self.bucket.name
+            self.bucket.meta.client.head_bucket(Bucket=bucket_name)
+        # Boto3 can raise any kind of error, so we catch all exceptions here to ensure the method returns False if anything goes wrong during the check.
+        except Exception:  # noqa: BLE001
+            return False
+
+        return True
+
+    def patch_nginx_download_redirect(self, response: HttpResponse) -> None:
+        """Patches a nginx redirect response for usage with S3. At the moment, does nothing.
+
+        Arguments:
+            response: HTTP redirect response to patch.
+        """
+        pass
+
+    def _get_write_parameters(
+        self, name: str, content: ContentFile | None = None
+    ) -> dict[str, Any]:
+        params = super()._get_write_parameters(name, content)
+
+        # Detect content type from the original filename embedded in the
+        # versioned S3 path, so it can be properly set in the object storage
+        # metadata and later returned as a `Content-Type` header when
+        # downloading the object.
+        # Versioned paths look like:
+        #   `projects/<uuid>/files/DCIM/photo.jpg/v20260317162354-512bd29b`
+        # Note the last part of the versioned name has the version timestamp
+        # and a random UUID fragment, which prevents `mimetypes.guess_type`
+        # from guessing a proper content type, as it uses the file extension
+        # to do so. Without this fix, the parent class's
+        # `_get_write_parameters` would set `ContentType` to `None`.
+        parts = name.rsplit("/", 1)
+        base_name = parts[-1]
+
+        if len(parts) == 2 and VERSION_SUFFIX_REGEX.fullmatch(parts[-1]):
+            base_name = parts[0].rsplit("/", 1)[-1]
+
+        mime_type, encoding = mimetypes.guess_type(base_name)
+        if mime_type:
+            params["ContentType"] = mime_type
+            if encoding:
+                params["ContentEncoding"] = encoding
+
+        return params
+
+
+HTTP_RETRIES_COUNT = 3
+HTTP_RETRIES_BACKOFF_FACTOR = 0.5
+
+
+class QfcWebDavStorage(QfcBackendStorageMixin, Storage):
+    """Storage backend using WebDAV.
+
+    Adapted and inspired by this repository: https://github.com/marazmiki/django-webdav-storage
+    Copyright (c) 2020, Mikhail Porokhovnichenko
+    """
+
+    def __init__(self, **options):
+        self.webdav_url = options.get("webdav_url")
+        if not self.webdav_url:
+            raise ImproperlyConfigured("Please define the `webdav_url` storage option")
+
+        self.public_url = options.get("public_url")
+        if not self.public_url:
+            raise ImproperlyConfigured("Please define the `public_url` storage option")
+
+        self.basic_auth = options.get("basic_auth")
+        if not self.basic_auth:
+            raise ImproperlyConfigured("Please define the `basic_auth` storage option")
+
+        self.requests = self.get_requests_session(**options)
+
+    def check_status(self) -> bool:
+        """Checks if the WebDAV storage is reachable.
+
+        Returns:
+            True if reachable, False if not.
+        """
+        try:
+            self.perform_webdav_request("HEAD", "/")
+        except requests.exceptions.RequestException:
+            return False
+
+        return True
+
+    def get_requests_session(self, **kwargs) -> requests.Session:
+        """Creates a HTTP session for requesting webdav later.
+
+        Authenticates using the `basic_auth` storage option.
+        """
+        session = requests.Session()
+
+        retries = Retry(
+            total=HTTP_RETRIES_COUNT,
+            backoff_factor=HTTP_RETRIES_BACKOFF_FACTOR,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "PUT", "DELETE", "MKCOL"],
+        )
+
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        username, _, password = self.basic_auth.partition(":")
+        session.auth = HTTPBasicAuth(username, password)
+
+        return session
+
+    def perform_webdav_request(
+        self, method: str, name: str, *args, **kwargs
+    ) -> requests.Response:
+        """Performs a webdav request.
+
+        Arguments:
+            method: webdav method, e.g. "HEAD", "GET", "PUT", "DELETE", etc.
+            name: relative path of the file on the webdav server.
+            *args: additional arguments
+            **kwargs: additional keyword arguments
+
+        Returns:
+            HTTP response related to the sent request.
+        """
+        url = self.get_webdav_url(name)
+        method = method.lower()
+
+        response = getattr(self.requests, method)(url, *args, **kwargs)
+        response.raise_for_status()
+
+        return response
+
+    def encode_webdav_path(self, name: str) -> str:
+        """Encodes each segment of a relative file path."""
+        segments = []
+        for segment in name.split("/"):
+            segments.append(quote(segment, safe=""))
+
+        return "/".join(segments)
+
+    def get_webdav_url(self, name: str) -> str:
+        """Returns the HTTP url for a webdav file.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+
+        Returns:
+            HTTP url for the file.
+        """
+        encoded_name = self.encode_webdav_path(name.lstrip("/"))
+        return self.webdav_url.rstrip("/") + "/" + encoded_name
+
+    def get_public_url(self, name: str) -> str:
+        """Returns the public HTTP url for a webdav file.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+
+        Returns:
+            Public HTTP url for the file.
+        """
+        encoded_name = self.encode_webdav_path(name.lstrip("/"))
+        return self.public_url.rstrip("/") + "/" + encoded_name
+
+    def _open(self, name: str, mode: str = "rb") -> ContentFile:
+        """Reads the content of a file from the configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+            mode: opening mode (default: "rb").
+
+        Returns:
+            Content of the requested file.
+        """
+        content = self.perform_webdav_request("GET", name).content
+        return ContentFile(content, name)
+
+    def _save(self, name: str, content: ContentFile) -> str:
+        """Saves a file on the configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+            content: content of the file to save.
+
+        Returns:
+            relative path of the file on the webdav server.
+        """
+        self.make_collection(name)
+
+        if hasattr(content, "temporary_file_path"):
+            with open(content.temporary_file_path(), "rb") as f:
+                self.perform_webdav_request(method="PUT", name=name, data=f)
+        else:
+            content.file.seek(0)
+            self.perform_webdav_request(method="PUT", name=name, data=content.file)
+
+        return name
+
+    def make_collection(self, name: str) -> None:
+        """Creates a so-called collection on the configured webdav storage for a file.
+
+        Typically creates parent folders if not existing.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+        """
+        coll_path = self.webdav_url
+
+        for directory in name.split("/")[:-1]:
+            encoded_directory = quote(directory, safe="")
+            col = os.path.join(coll_path, encoded_directory, "")
+            resp = self.requests.head(col)
+
+            if not resp.ok:
+                resp = self.requests.request("MKCOL", col)
+                resp.raise_for_status()
+
+            coll_path = os.path.join(coll_path, encoded_directory)
+
+    def delete(self, name: str) -> None:
+        """Deletes a file from a configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+        """
+        with contextlib.suppress(requests.HTTPError):
+            self.perform_webdav_request("DELETE", name)
+
+    def exists(self, name: str) -> bool:
+        """Checks if a file exists on a configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+
+        Returns:
+            True if exists, False if not.
+        """
+        try:
+            self.perform_webdav_request("HEAD", name)
+        except requests.exceptions.HTTPError:
+            return False
+
+        return True
+
+    def size(self, name: str) -> int:
+        """Returns the size of a file on a configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+
+        Raises:
+            IOError: if something wrong happens during the network request.
+
+        Returns:
+            Size in bytes of the requested file.
+        """
+        try:
+            return int(
+                self.perform_webdav_request("HEAD", name).headers["content-length"]
+            )
+        except (ValueError, requests.exceptions.HTTPError):
+            raise OSError("Unable get size for {}".format(name))
+
+    def url(self, name: str, **kwargs) -> str:  # type: ignore
+        """Returns the URL of a file from the configured webdav storage.
+
+        Arguments:
+            name: relative path of the file on the webdav server.
+            **kwargs: additional keyword arguments
+
+        Returns:
+            Public webdav URL of the file.
+        """
+        return self.get_public_url(name)
+
+    def patch_nginx_download_redirect(self, response: HttpResponse) -> None:
+        """Patches a nginx redirect response for usage with WebDAV.
+
+        Adds configured webdav/HTTP basic auth, required for nginx redirect.
+
+        Arguments:
+            response: HTTP redirect response to patch.
+        """
+        b64_auth = base64.b64encode(self.basic_auth.encode()).decode()
+        basic_auth = f"Basic {b64_auth}"
+        response["webdav_auth"] = basic_auth
+
+    def get_available_name(self, name: str, max_length: int | None = None) -> str:
+        """Returns a filename that is available on the configured webdav storage.
+
+        Arguments:
+            name: desired relative path of the file on the webdav server.
+            max_length: maximum length of the filename (not used).
+        """
+        if self.is_name_available(name, max_length):
+            return super().get_available_name(name, max_length)
+
+        return name

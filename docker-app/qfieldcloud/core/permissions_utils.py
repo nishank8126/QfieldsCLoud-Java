@@ -1,0 +1,1036 @@
+from typing import Any, Literal
+
+from django.utils.translation import gettext as _
+from rest_framework.request import Request
+
+from qfieldcloud.authentication.models import AuthToken
+from qfieldcloud.core.models import (
+    Delta,
+    Job,
+    Organization,
+    OrganizationMember,
+    OrganizationQueryset,
+    Secret,
+    Team,
+)
+from qfieldcloud.core.models import User as QfcUser
+from qfieldcloud.project.enums import ProjectCollaboratorRole, ProjectRoleOrigins
+from qfieldcloud.project.models import Project
+from qfieldcloud.subscription.exceptions import (
+    InactiveSubscriptionError,
+    PlanInsufficientError,
+    QuotaError,
+    SubscriptionException,
+)
+from qfieldcloud.subscription.models import Subscription
+
+
+class CheckPermError(Exception): ...
+
+
+class AlreadyCollaboratorError(CheckPermError): ...
+
+
+class ReachedCollaboratorLimitError(CheckPermError): ...
+
+
+class UserHasProjectRoleOriginsError(CheckPermError): ...
+
+
+class UserProjectRoleError(CheckPermError): ...
+
+
+class UserOrganizationRoleError(CheckPermError): ...
+
+
+class TeamOrganizationRoleError(CheckPermError): ...
+
+
+class ExpectedPremiumUserError(CheckPermError): ...
+
+
+def user_eq(user1: QfcUser, user2: QfcUser) -> bool:
+    """Checks if User model derivatives are equal.
+
+    NOTE User(pk=12) is not equal to Person(pk=12)!
+    """
+    return user1.pk == user2.pk
+
+
+def _project_for_owner(user: QfcUser, project: Project, skip_invalid: bool):
+    return (
+        Project.objects.slim()
+        .for_user(user, skip_invalid)
+        .select_related(None)
+        .filter(pk=project.pk)
+    )
+
+
+def _organization_of_owner(user: QfcUser, organization: Organization):
+    return (
+        Organization.objects.of_user(user)
+        .select_related(None)
+        .filter(pk=organization.pk)
+    )
+
+
+def user_has_project_roles(
+    user: QfcUser,
+    project: Project,
+    roles: list[ProjectCollaboratorRole],
+    skip_invalid: bool = False,
+):
+    return (
+        _project_for_owner(user, project, skip_invalid)
+        .filter(user_role__in=roles)
+        .exists()
+    )
+
+
+def check_user_has_project_roles(
+    user: QfcUser, project: Project, roles: list[ProjectCollaboratorRole]
+) -> Literal[True]:
+    if user_has_project_roles(user, project, roles):
+        return True
+
+    raise UserProjectRoleError(
+        'User "{}" has not role "{}" on project {}.'.format(
+            user.username,
+            [role.name for role in roles],
+            project.name,
+        )
+    )
+
+
+def check_user_has_project_role_origins(
+    user: QfcUser, project: Project, origins: list[ProjectRoleOrigins]
+) -> Literal[True]:
+    if (
+        _project_for_owner(user, project, skip_invalid=False)
+        .filter(user_role_origin__in=origins)
+        .exists()
+    ):
+        return True
+
+    raise UserHasProjectRoleOriginsError(
+        'User "{}" has not role origins "{}" on project {}.'.format(
+            user.username,
+            [origin.name for origin in origins],
+            project.name,
+        )
+    )
+
+
+def user_has_project_role_origins(
+    user: QfcUser, project: Project, origins: list[ProjectRoleOrigins]
+) -> bool:
+    try:
+        return check_user_has_project_role_origins(user, project, origins)
+    except CheckPermError:
+        return False
+
+
+def check_user_has_organization_roles(
+    user: QfcUser, organization: Organization, roles: list[OrganizationMember.Roles]
+) -> Literal[True]:
+    if (
+        _organization_of_owner(user, organization)
+        .filter(membership_role__in=roles)
+        .exists()
+    ):
+        return True
+
+    raise UserOrganizationRoleError(
+        _('User "{}" does not have {} roles in organization "{}"').format(
+            user.username,
+            [role.name for role in roles],
+            organization.username,
+        )
+    )
+
+
+def user_has_organization_roles(
+    user: QfcUser, organization: Organization, roles: list[OrganizationMember.Roles]
+) -> bool:
+    try:
+        return check_user_has_organization_roles(user, organization, roles)
+    except CheckPermError:
+        return False
+
+
+def user_has_organization_role_origins(
+    user: QfcUser,
+    organization: Organization,
+    origins: list[OrganizationQueryset.RoleOrigins],
+):
+    return (
+        _organization_of_owner(user, organization)
+        .filter(membership_role_origin__in=origins)
+        .exists()
+    )
+
+
+def get_url_kwarg(request: Request, param: str) -> Any:
+    """Return the `param` URL kwarg of the request, or `None` if it is missing.
+
+    NOTE never read resource identifiers for permission checks from the request body.
+    The views act on the resource from the URL, so a body value would make the
+    permission check run against a different resource than the one being modified.
+    """
+    return request.parser_context["kwargs"].get(param)
+
+
+def can_create_project(
+    user: QfcUser, organization: QfcUser | Organization = None
+) -> bool:
+    """Return True if the `user` can create a project.
+
+    Accepts additional `organization` to check whether the user has permissions to do so on that organization.
+    Return False otherwise.
+    """
+    if organization is None:
+        return True
+
+    if organization.is_organization:
+        if not isinstance(organization, Organization):
+            organization = organization.organization  # type: ignore
+    else:
+        # the user checks if they can create project of their own
+        return user == organization
+
+    if user_has_organization_roles(
+        user,
+        organization,
+        [OrganizationMember.Roles.ADMIN, OrganizationMember.Roles.CREATOR],
+    ):
+        return True
+
+    return False
+
+
+def can_read_organization_secrets(user: QfcUser, organization: Organization) -> bool:
+    return user_has_organization_roles(
+        user,
+        organization,
+        [
+            OrganizationMember.Roles.ADMIN,
+        ],
+    )
+
+
+def can_create_organization_secrets(user: QfcUser, organization: Organization) -> bool:
+    return user_has_organization_roles(
+        user,
+        organization,
+        [
+            OrganizationMember.Roles.ADMIN,
+        ],
+    )
+
+
+def can_delete_organization_secrets(user: QfcUser, organization: Organization) -> bool:
+    return user_has_organization_roles(
+        user,
+        organization,
+        [
+            OrganizationMember.Roles.ADMIN,
+        ],
+    )
+
+
+def can_delete_secret(user: QfcUser, secret: Secret) -> bool:
+    if secret.organization:
+        return user_has_organization_roles(
+            user,
+            secret.organization,
+            [
+                OrganizationMember.Roles.ADMIN,
+            ],
+        )
+    elif secret.project:
+        return user_has_project_roles(
+            user,
+            secret.project,
+            [
+                ProjectCollaboratorRole.ADMIN,
+            ],
+        )
+    else:
+        raise NotImplementedError(
+            "Secret must be either project or organization secret."
+        )
+
+
+def can_access_project(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+            ProjectCollaboratorRole.READER,
+        ],
+    )
+
+
+def can_retrieve_project(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+            ProjectCollaboratorRole.READER,
+        ],
+        True,
+    )
+
+
+def can_update_project(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_transfer_project(user: QfcUser, project: Project, new_owner: QfcUser) -> bool:
+    """Return True if the `user` can transfer the `project` to `new_owner`.
+
+    Only the project owner, or the owner or an admin of the organization owning the project,
+    can give the project away. Collaborators cannot, regardless of their role.
+    The `new_owner` must be an account the `user` can create projects for.
+    """
+    if not user_has_project_role_origins(
+        user,
+        project,
+        [
+            ProjectRoleOrigins.PROJECTOWNER,
+            ProjectRoleOrigins.ORGANIZATIONOWNER,
+            ProjectRoleOrigins.ORGANIZATIONADMIN,
+        ],
+    ):
+        return False
+
+    return can_create_project(user, new_owner)
+
+
+def can_delete_project(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_create_files(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+        ],
+    )
+
+
+def can_modify_qgis_projectfile(user: QfcUser, project: Project) -> bool:
+    if project.has_restricted_projectfiles:
+        return user_has_project_roles(
+            user,
+            project,
+            [
+                ProjectCollaboratorRole.ADMIN,
+                ProjectCollaboratorRole.MANAGER,
+            ],
+        )
+    else:
+        return user_has_project_roles(
+            user,
+            project,
+            [
+                ProjectCollaboratorRole.ADMIN,
+                ProjectCollaboratorRole.MANAGER,
+                ProjectCollaboratorRole.EDITOR,
+                ProjectCollaboratorRole.REPORTER,
+            ],
+        )
+
+
+def can_read_projects(user: QfcUser, _account: QfcUser) -> bool:
+    return user.is_authenticated
+
+
+def can_read_public_projects(user: QfcUser) -> bool:
+    return user.is_authenticated
+
+
+def can_read_files(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+            ProjectCollaboratorRole.READER,
+        ],
+    )
+
+
+def can_delete_files(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+        ],
+    )
+
+
+def can_delete_unnecessary_file_versions(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+        ],
+    )
+
+
+def can_create_deltas(user: QfcUser, project: Project) -> bool:
+    """Whether the user can store deltas in a project."""
+    if project.is_template_project:
+        return False
+
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+        ],
+    )
+
+
+def can_read_deltas(user: QfcUser, project: Project) -> bool:
+    if project.is_template_project:
+        return False
+
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+        ],
+    )
+
+
+def can_apply_pending_deltas_for_project(user: QfcUser, project: Project) -> bool:
+    if project.is_template_project:
+        return False
+
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_set_delta_status_for_project(user: QfcUser, project: Project) -> bool:
+    if project.is_template_project:
+        return False
+
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_set_delta_status(user: QfcUser, delta: Delta) -> bool:
+    if not can_set_delta_status_for_project(user, delta.project):
+        return False
+
+    if delta.last_status not in (
+        Delta.Status.PENDING,
+        Delta.Status.CONFLICT,
+        Delta.Status.NOT_APPLIED,
+        Delta.Status.ERROR,
+        Delta.Status.APPLIED,
+        Delta.Status.IGNORED,
+        Delta.Status.UNPERMITTED,
+    ):
+        return False
+
+    return True
+
+
+def can_create_delta(user: QfcUser, delta: Delta) -> bool:
+    """Whether the user can store given delta."""
+    project: Project = delta.project
+
+    if project.is_template_project:
+        return False
+
+    if user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+        ],
+    ):
+        return True
+
+    if user_has_project_roles(user, project, [ProjectCollaboratorRole.REPORTER]):
+        if delta.method == Delta.Method.Create:
+            return True
+
+    return False
+
+
+def can_list_jobs(user: QfcUser, project: Project) -> bool:
+    """Check if the user has permission to list/retrieve jobs via API."""
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+            ProjectCollaboratorRole.READER,
+        ],
+    )
+
+
+def can_read_jobs(user: QfcUser, project: Project) -> bool:
+    """Check if the user has permission to see the job details in the Web UI."""
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+        ],
+    )
+
+
+def can_create_jobs(user: QfcUser, project: Project, job_type: Job.Type) -> bool:
+    """Check if the user has permission to create a job of the given type."""
+    if job_type == Job.Type.PACKAGE and not project.is_regular_project:
+        return False
+
+    if job_type == Job.Type.PACKAGE:
+        roles = list(ProjectCollaboratorRole)
+    elif job_type in (Job.Type.PROCESS_PROJECTFILE, Job.Type.DELTA_APPLY):
+        roles = [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+        ]
+    else:
+        raise NotImplementedError(f'Unknown job type "{job_type}"')
+
+    return user_has_project_roles(user, project, roles)
+
+
+def can_read_project_secrets(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+        ],
+    )
+
+
+def can_create_project_secrets(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+        ],
+    )
+
+
+def can_delete_project_secrets(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+        ],
+    )
+
+
+def can_list_users_organizations(user: QfcUser) -> bool:
+    """Return True if the `user` can list users and organizations. Return False otherwise."""
+    return True
+
+
+def can_create_user(user: QfcUser) -> bool:
+    """Return True if the user can create new QFieldCloud accounts.
+
+    Restricted to staff so only service accounts and admins can provision
+    users programmatically via the API.
+    """
+    return user.is_staff
+
+
+def can_create_organizations(user: QfcUser) -> bool:
+    return user.is_authenticated
+
+
+def can_update_user(user: QfcUser, account: QfcUser) -> bool:
+    if user_eq(user, account):
+        return True
+
+    if user_has_organization_roles(user, account, [OrganizationMember.Roles.ADMIN]):
+        return True
+
+    return False
+
+
+def can_delete_user(user: QfcUser, account: QfcUser) -> bool:
+    if user_eq(user, account):
+        return True
+
+    if account.is_organization:
+        return user_has_organization_role_origins(
+            user,
+            account,
+            [
+                OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER,
+            ],
+        )
+
+    return False
+
+
+def can_transfer_organization(user: QfcUser, organization: QfcUser) -> bool:
+    if not organization.is_organization:
+        return False
+
+    return user_has_organization_role_origins(
+        user,
+        organization,
+        [
+            OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER,
+        ],
+    )
+
+
+def can_create_collaborators(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_read_collaborators(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_update_collaborators(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_delete_collaborators(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+        ],
+    )
+
+
+def can_read_packages(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaboratorRole.ADMIN,
+            ProjectCollaboratorRole.MANAGER,
+            ProjectCollaboratorRole.EDITOR,
+            ProjectCollaboratorRole.REPORTER,
+            ProjectCollaboratorRole.READER,
+        ],
+    )
+
+
+def can_create_members(user: QfcUser, organization: Organization) -> bool:
+    """Return True if the `user` can create members (incl. teams) of `organization`. Return False otherwise."""
+    return user_has_organization_roles(
+        user, organization, [OrganizationMember.Roles.ADMIN]
+    )
+
+
+def can_read_members(user: QfcUser, organization: Organization) -> bool:
+    """Return True if the `user` can list members (incl. teams) of `organization`. Return False otherwise."""
+    if not organization.is_organization:
+        return False
+
+    return True
+
+
+def can_update_members(user: QfcUser, organization: Organization) -> bool:
+    return user_has_organization_roles(
+        user, organization, [OrganizationMember.Roles.ADMIN]
+    )
+
+
+def can_delete_members(user: QfcUser, organization: Organization) -> bool:
+    return user_has_organization_roles(
+        user, organization, [OrganizationMember.Roles.ADMIN]
+    )
+
+
+def check_can_become_collaborator(user: QfcUser, project: Project) -> bool:
+    if user_eq(user, project.owner):
+        raise AlreadyCollaboratorError(
+            _("Cannot add the project owner as a collaborator.")
+        )
+
+    if project.collaborators.filter(collaborator=user).exists():
+        raise AlreadyCollaboratorError(
+            _('The user "{}" is already a collaborator of project "{}".').format(
+                user.username, project.name
+            )
+        )
+
+    max_premium_collaborators_per_private_project = project.owner.useraccount.current_subscription.plan.max_premium_collaborators_per_private_project
+    if max_premium_collaborators_per_private_project >= 0 and not project.is_public:
+        project_collaborators_count = project.direct_collaborators.count()
+        if project_collaborators_count >= max_premium_collaborators_per_private_project:
+            raise ReachedCollaboratorLimitError(
+                _(
+                    "The subscription plan of the project owner does not allow any additional collaborators. "
+                    "Please remove some collaborators first."
+                )
+            )
+
+    # Rules for organization projects
+    if project.owner.is_organization:
+        if user.is_team:
+            if (
+                Team.objects.filter(
+                    pk=user.pk,
+                    team_organization=project.owner,
+                ).count()
+                != 1
+            ):
+                raise TeamOrganizationRoleError(
+                    _(
+                        'The team "{}" is not owned by the "{}" organization that owns the project.'
+                    ).format(
+                        user.username,
+                        project.owner.username,
+                    )
+                )
+        else:
+            # On a private project only organization members can join. A public
+            # project can have collaborators who are not members of the organization.
+            if not project.is_public:
+                check_user_has_organization_roles(
+                    user,
+                    project.owner,
+                    [
+                        OrganizationMember.Roles.MEMBER,
+                        OrganizationMember.Roles.CREATOR,
+                        OrganizationMember.Roles.ADMIN,
+                    ],
+                )
+    else:
+        if user.is_team:
+            raise TeamOrganizationRoleError(
+                _(
+                    "Teams can be added as collaborators only in projects owned by organizations."
+                )
+            )
+
+        # Rules for private projects
+        if not project.is_public:
+            if not user.useraccount.current_subscription.plan.is_premium:
+                raise ExpectedPremiumUserError(
+                    _(
+                        "Only users who upgraded from free plan can be added as collaborators on private projects."
+                    ).format(user.username)
+                )
+
+    return True
+
+
+def can_become_collaborator(user: QfcUser, project: Project) -> bool:
+    try:
+        return check_can_become_collaborator(user, project)
+    except CheckPermError:
+        return False
+
+
+def can_become_member(user: QfcUser, organization: Organization) -> bool:
+    if user.type == QfcUser.Type.ORGANIZATION:
+        return False
+
+    if user.type == QfcUser.Type.TEAM:
+        return Team.objects.get(pk=user.pk).team_organization == organization
+
+    return not user_has_organization_role_origins(
+        user,
+        organization,
+        [
+            OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER,
+            OrganizationQueryset.RoleOrigins.ORGANIZATIONMEMBER,
+        ],
+    )
+
+
+def can_send_invitations(user: QfcUser, account: QfcUser) -> bool:
+    if user.pk != account.pk:
+        return False
+
+    if account.is_person:
+        return True
+
+    return False
+
+
+def can_read_billing(user: QfcUser, account: QfcUser) -> bool:
+    if user_eq(user, account):
+        return True
+
+    if account.is_organization:
+        return user_has_organization_role_origins(
+            user,
+            account,
+            [
+                OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER,
+            ],
+        )
+    else:
+        return False
+
+
+def can_read_current_subscription(user: QfcUser, account: QfcUser) -> bool:
+    if user_eq(user, account):
+        return True
+
+    if account.is_organization:
+        return user_has_organization_role_origins(
+            user,
+            account,
+            [
+                OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER,
+                OrganizationQueryset.RoleOrigins.ORGANIZATIONMEMBER,
+            ],
+        )
+    else:
+        return False
+
+
+def can_change_additional_storage(user: QfcUser, subscription: Subscription) -> bool:
+    # NOTE buying storage acts on the plan that will be billed, not on the trial
+    if not subscription.regular_plan.is_storage_modifiable:
+        return False
+
+    # assuming that active until is the same as current_period_until
+    # TODO change this when yearly subscriptions are supported
+    if subscription.active_until:
+        return False
+
+    if subscription.account.user.is_person:
+        return user_eq(user, subscription.account.user)
+    elif subscription.account.user.is_organization:
+        return user_has_organization_role_origins(
+            user,
+            subscription.account,
+            [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
+        )
+
+    return False
+
+
+def can_cancel_subscription_at_period_end(
+    user: QfcUser, subscription: Subscription
+) -> bool:
+    """Cannot cancel subscription if different from the personal account, or the plan is not cancellable.
+
+    Organization can be downgraded only by owners, need to be deleted.
+    In any case cancellation is only possible if the plan allows it.
+    """
+    if subscription.active_until is not None:
+        return False
+
+    # NOTE for a trial this stops its conversion, so the plan to be billed decides
+    if not subscription.regular_plan.is_cancellable:
+        return False
+
+    if subscription.account.user.is_person:
+        return user_eq(user, subscription.account.user)
+
+    return user_has_organization_role_origins(
+        user,
+        subscription.account.user,
+        [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
+    )
+
+
+def can_cancel_subscription_immediately(
+    user: QfcUser, subscription: Subscription
+) -> bool:
+    """Cannot cancel subscription if different from the personal account, or the plan is not cancellable.
+
+    Organization can be downgraded only by owners, need to be deleted.
+    In any case cancellation is only possible if the plan allows it.
+    """
+    # NOTE the active plan decides, so a trial cannot be cancelled right away
+    if not subscription.plan.is_cancellable:
+        return False
+
+    if subscription.account.user.is_person:
+        return user_eq(user, subscription.account.user)
+
+    return user_has_organization_role_origins(
+        user,
+        subscription.account.user,
+        [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
+    )
+
+
+def can_end_trial_immediately(user: QfcUser, subscription: Subscription) -> bool:
+    """Cannot end a trial early if it is not currently trialing, or the user does not own the account."""
+    if not subscription.is_trialing:
+        return False
+
+    if subscription.account.user.is_person:
+        return user_eq(user, subscription.account.user)
+
+    return user_has_organization_role_origins(
+        user,
+        subscription.account.user,
+        [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
+    )
+
+
+def can_abort_subscription_cancellation(
+    user: QfcUser, subscription: Subscription
+) -> bool:
+    if subscription.active_until is None:
+        return False
+
+    if not subscription.regular_plan.is_cancellable:
+        return False
+
+    if subscription.account.user.is_person:
+        return user_eq(user, subscription.account.user)
+
+    return user_has_organization_role_origins(
+        user,
+        subscription.account.user,
+        [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
+    )
+
+
+def check_supported_regarding_owner_account(
+    project: Project, ignore_online_layers: bool = False
+) -> Literal[True]:
+    account = project.owner.useraccount
+    subscription = account.current_subscription
+
+    if not subscription.is_active:
+        raise InactiveSubscriptionError
+
+    if not account.storage_free_bytes > 0:
+        raise QuotaError
+
+    if not ignore_online_layers:
+        if (
+            project.has_online_vector_data
+            and not subscription.plan.is_external_db_supported
+        ):
+            raise PlanInsufficientError(
+                _(
+                    "Owner's subscription plan does not support online vector layer datasource."
+                )
+            )
+
+    return True
+
+
+def is_supported_regarding_owner_account(project: Project) -> bool:
+    try:
+        return check_supported_regarding_owner_account(project)
+    except SubscriptionException:
+        return False
+
+
+def can_always_upload_files(client_type) -> bool:
+    return client_type in (
+        AuthToken.ClientType.QFIELD,
+        AuthToken.ClientType.WORKER,
+    )
+
+
+def check_can_upload_file(project, client_type, file_size_bytes: int) -> bool:
+    if can_always_upload_files(client_type):
+        return True
+
+    quota_left_bytes = project.owner.useraccount.storage_free_bytes
+    if file_size_bytes > quota_left_bytes:
+        raise QuotaError(
+            f"Requiring {file_size_bytes} bytes of storage but only {quota_left_bytes} bytes available."
+        )
+    else:
+        return True

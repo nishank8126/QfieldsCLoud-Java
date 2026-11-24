@@ -1,0 +1,578 @@
+import argparse
+import enum
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, cast
+from uuid import UUID
+
+from convert2qgis.errors import Convert2QgisBaseError
+from convert2qgis.json2qgis.json2qgis import ProjectCreator
+from convert2qgis.xlsform2qgis.type_defs import ConverterSettings
+from convert2qgis.xlsform2qgis.xlsform2qgis import (
+    convert_xlsform_to_qgis_project,
+)
+from qfieldcloud_sdk import sdk
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsHueSaturationFilter,
+    QgsProject,
+    QgsRasterLayer,
+    QgsRectangle,
+    QgsReferencedRectangle,
+)
+
+from qfc_worker.commands_base import QfcBaseCommand
+from qfc_worker.exceptions import humanize_error
+from qfc_worker.utils import (
+    download_project,
+    get_layers_data,
+    layers_data_to_string,
+    open_qgis_project,
+    save_project,
+    start_app,
+    stop_app,
+    upload_project,
+)
+from qfc_worker.workflow import (
+    Step,
+    StepOutput,
+    UnableToContinueError,
+    WorkDirPath,
+    Workflow,
+)
+
+if TYPE_CHECKING:
+    from convert2qgis.xlsform2qgis.type_defs import ConverterSettings
+
+logger = logging.getLogger(__name__)
+
+
+SchemaId = str
+
+
+class XlsformConfigDict(TypedDict):
+    show_groups_as_tabs: bool
+    filename: str
+
+
+class BasemapConfig(TypedDict):
+    url: str
+    name: str
+    style: str
+
+
+class ProjectSeedSettingsDict(TypedDict):
+    schemaId: SchemaId
+    xlsform: XlsformConfigDict | None
+    basemaps: list[BasemapConfig]
+
+
+class ProjectSeedDict(TypedDict):
+    name: str
+    crs: str
+    settings: ProjectSeedSettingsDict
+
+
+class BasemapStyle(str, enum.Enum):
+    STANDARD = "standard"
+    GRAYSCALE_LIGHT = "grayscale_light"
+    GRAYSCALE_DARK = "grayscale_dark"
+
+
+@dataclass
+class ProjectSeedSettings:
+    schemaId: SchemaId  # noqa: N815
+    xlsform: XlsformConfigDict | None = None
+    basemaps: list[BasemapConfig] = field(default_factory=list)
+
+
+@dataclass
+class ProjectSeed:
+    project: str
+    crs: str
+    name: str
+    extent: list[float] | None
+    clone_from_project: UUID | None
+    xlsform_file: str | None
+    json2qgis_file: str | None
+
+    settings: ProjectSeedSettings  # type: ignore
+    _settings: ProjectSeedSettings = field(init=False, repr=False)
+
+    @property  # type: ignore
+    def settings(self) -> ProjectSeedSettings:
+        return self._settings
+
+    @settings.setter
+    def settings(self, value: ProjectSeedSettingsDict) -> None:
+        schema_id = value["schemaId"]
+
+        if schema_id == "https://app.qfield.cloud/schemas/project-seed-20251201.json":
+            self._settings = ProjectSeedSettings(**value)
+        else:
+            raise NotImplementedError(
+                f"Project seed settings version '{value['schemaId']}' is not supported."
+            )
+
+
+def get_project_qgis_file_name(project_id: str) -> str | None:
+    client = sdk.Client()
+
+    project = client.get_project(project_id)
+
+    project_filename = project.get("the_qgis_file_name")
+
+    return project_filename
+
+
+def get_project_seed(project_id: str) -> ProjectSeed:
+    client = sdk.Client()
+
+    project_seed = client.get_project_seed(project_id)
+
+    return ProjectSeed(**project_seed)
+
+
+def get_project_seed_files(
+    project_id: str, project_seed: ProjectSeed, destination_dir: str
+) -> tuple[str | None, str | None]:
+    """Download the seed's XLSForm or JSON2QGIS file."""
+    project_seed_files = (None, None)
+
+    if project_seed.settings.xlsform:
+        client = sdk.Client()
+        xlsform_filename = client.get_project_seed_xlsform(project_id, destination_dir)
+
+        logger.info(f"Downloaded XLSForm file to '{xlsform_filename}'.")
+
+        project_seed_files = (xlsform_filename, None)
+
+    if project_seed.json2qgis_file:
+        client = sdk.Client()
+        json2qgis_filename = client.get_project_seed_json2qgis(
+            project_id, destination_dir
+        )
+
+        logger.info(f"Downloaded JSON2QGIS file to '{json2qgis_filename}'.")
+
+        project_seed_files = (None, json2qgis_filename)
+
+    if project_seed_files == (None, None):
+        logger.info("No XLSForm or JSON2QGIS file configured for this project seed.")
+
+    return project_seed_files
+
+
+def _create_project_from_xlsform(
+    xlsform_filename: str | None, project_seed: ProjectSeed, tmp_project_dir: str
+) -> Path | None:
+    assert project_seed.settings.xlsform is not None
+
+    if xlsform_filename is None:
+        logger.error("No XLSForm file was downloaded for this project, aborting.")
+
+        return None
+
+    xlsform_path = Path(tmp_project_dir).joinpath("files", xlsform_filename)
+
+    logger.info(f"Checking provided XLSForm file '{xlsform_path}'...")
+
+    if not xlsform_path.exists():
+        logger.error(
+            f"The provided XLSForm file '{xlsform_path}' does not exist, aborting."
+        )
+
+        return None
+
+    output_dir = Path(tmp_project_dir).joinpath("files")
+    converter_settings = cast(
+        "ConverterSettings",
+        {
+            "title": project_seed.name,
+            "show_groups_as_tabs": project_seed.settings.xlsform["show_groups_as_tabs"],
+            "basemap_url": "",
+        },
+    )
+
+    try:
+        project = convert_xlsform_to_qgis_project(
+            xlsform_path,
+            output_dir=output_dir,
+            settings=converter_settings,
+            skip_failed_expressions=True,
+            # NOTE: set to a temporary file so one can inspect and debug the generated JSON
+            json_filename="/tmp/xlsform.json",
+        )
+    except Convert2QgisBaseError as err:
+        logger.error(
+            "Failed to convert XLSForm to QGIS project: %s", humanize_error(err)
+        )
+
+        raise UnableToContinueError(
+            reason="Unable to continue project creation, this job will be cancelled and have failed status!",
+        ) from err
+
+    full_filename = Path(output_dir).joinpath(project.fileName())
+
+    return full_filename
+
+
+def _create_project_from_json2qgis(
+    json2qgis_filename: str | None, project_seed: ProjectSeed, tmp_project_dir: str
+) -> Path | None:
+    assert project_seed.json2qgis_file is not None
+
+    if json2qgis_filename is None:
+        logger.error("No JSON2QGIS file was downloaded for this project, aborting.")
+
+        return None
+
+    json2qgis_path = Path(tmp_project_dir).joinpath("files", json2qgis_filename)
+
+    logger.info(f"Checking provided JSON2QGIS file '{json2qgis_path}'...")
+
+    if not json2qgis_path.exists():
+        logger.error(
+            f"The provided JSON2QGIS file '{json2qgis_path}' does not exist, aborting."
+        )
+
+        return None
+
+    output_dir = Path(tmp_project_dir).joinpath("files")
+
+    try:
+        with open(json2qgis_path) as fh:
+            project_definition = json.load(fh)
+
+        creator = ProjectCreator(project_definition)
+        project = creator.build(output_dir)
+    except Convert2QgisBaseError as err:
+        logger.error(
+            "Failed to convert JSON2QGIS file to QGIS project: %s", humanize_error(err)
+        )
+
+        raise UnableToContinueError(
+            reason="Unable to continue project creation, this job will be cancelled and have failed status!",
+        ) from err
+
+    full_filename = Path(output_dir).joinpath(project.fileName())
+
+    return full_filename
+
+
+def prepare_project_files(
+    project_seed: ProjectSeed,
+    tmp_project_dir: str,
+    xlsform_filename: str | None,
+    json2qgis_filename: str | None,
+) -> str:
+    """Prepare QGIS project files from seed (clone, XLSForm, JSON2QGIS, or empty).
+
+    Returns the path to the QGIS project file on disk.
+    """
+    project_filename = None
+
+    if project_seed.clone_from_project:
+        source_id = str(project_seed.clone_from_project)
+
+        download_project(
+            source_id, destination=Path(tmp_project_dir), skip_attachments=False
+        )
+
+        project_qgis_file_name = get_project_qgis_file_name(source_id)
+
+        if not project_qgis_file_name:
+            raise FileNotFoundError(
+                f"No QGIS project file name known for source project {source_id}"
+            )
+
+        project_filename = Path(tmp_project_dir).joinpath(
+            "files", project_qgis_file_name
+        )
+
+        return str(project_filename)
+
+    if project_seed.settings.xlsform and project_seed.json2qgis_file:
+        raise UnableToContinueError(
+            reason=(
+                "Project seed has both an XLSForm and a JSON2QGIS file configured. "
+                "This should never happen, aborting."
+            ),
+        )
+
+    if project_seed.settings.xlsform:
+        logger.info(f'Creating QGIS project from XLSForm from "{xlsform_filename}"...')
+
+        project_filename = _create_project_from_xlsform(
+            xlsform_filename, project_seed, tmp_project_dir
+        )
+
+        if project_filename is None:
+            logger.info(
+                "Failed to create project from XLSForm. Creating empty QGIS project..."
+            )
+        else:
+            project_filename = Path(project_filename)
+    elif project_seed.json2qgis_file:
+        logger.info(
+            f'Creating QGIS project from JSON2QGIS file from "{json2qgis_filename}"...'
+        )
+
+        project_filename = _create_project_from_json2qgis(
+            json2qgis_filename, project_seed, tmp_project_dir
+        )
+
+        if project_filename is None:
+            logger.info(
+                "Failed to create project from JSON2QGIS file. Creating empty QGIS project..."
+            )
+        else:
+            project_filename = Path(project_filename)
+    else:
+        logger.info("Creating empty QGIS project...")
+
+    if not project_filename:
+        project_filename = Path(tmp_project_dir).joinpath("files", "project.qgz")
+
+    return str(project_filename)
+
+
+def configure_qgis_project(project_seed: ProjectSeed, project_filename: str) -> str:
+    """Open the QGIS project and apply all seed configuration.
+
+    Sets title, CRS, basemaps.
+    """
+    project_filepath = Path(project_filename)
+
+    if project_filepath.exists():
+        project = open_qgis_project(project_filename)
+    else:
+        project = QgsProject.instance()
+        project_filepath.parent.mkdir(exist_ok=True, parents=True)
+        project.setFileName(str(project_filepath))
+
+    project.setTitle(project_seed.name)
+
+    if project_seed.clone_from_project:
+        logger.info("Cloning an existing project, keeping the source project's CRS.")
+    else:
+        crs = QgsCoordinateReferenceSystem(project_seed.crs)
+        if crs.isValid():
+            project.setCrs(crs)
+        else:
+            logger.warning(
+                "Project CRS parameter is invalid, skipping CRS configuration."
+            )
+
+    if project_seed.settings.basemaps and not project_seed.clone_from_project:
+        logger.info("Adding basemaps to the project...")
+
+        for basemap_config in project_seed.settings.basemaps:
+            layer = create_basemap_layer(basemap_config)
+
+            if layer:
+                layer_bridge = project.layerTreeRegistryBridge()
+                layer_tree_root = project.layerTreeRoot()
+                layer_tree_children_count = len(layer_tree_root.children())
+
+                # sets the "state" of the layer insertion point to the end of the layer tree
+                layer_bridge.setLayerInsertionPoint(
+                    layer_tree_root,
+                    layer_tree_children_count,
+                )
+
+                # add the layer to the project
+                is_success_add = project.addMapLayer(layer)
+
+                if is_success_add:
+                    logger.info(
+                        f'Successfully added basemap layer "{basemap_config["name"]}" to project.'
+                    )
+                else:
+                    logger.warning(
+                        f'Failed to add basemap layer "{basemap_config["name"]}" to project.'
+                    )
+            else:
+                logger.warning(
+                    f'Failed to create basemap layer "{basemap_config["name"]}".'
+                )
+    else:
+        logger.info("No basemaps configured for this project seed.")
+
+    project_filepath.parent.mkdir(exist_ok=True, parents=True)
+
+    project_extent = None
+
+    if project_seed.extent:
+        logger.info(f"Setting project extent to {project_seed.extent} EPSG:4326...")
+
+        assert len(project_seed.extent) == 4
+
+        # The extent is always in EPSG:4326, even if the project CRS is different,
+        # so we need to create a `QgsReferencedRectangle` with the correct CRS.
+        project_extent = QgsReferencedRectangle(
+            QgsRectangle(*project_seed.extent),
+            QgsCoordinateReferenceSystem("EPSG:4326"),
+        )
+
+    logger.info(f"Saving QGIS project to {project_filename}...")
+
+    save_project(project, project_extent)
+
+    return str(project_filename)
+
+
+def extract_layer_data(the_qgis_file_name: str | Path) -> dict:
+    logger.info("Extracting QGIS project layer data…")
+
+    project = open_qgis_project(str(the_qgis_file_name))
+    layers_by_id: dict = get_layers_data(project)
+
+    logger.info(
+        f"QGIS project layer data\n{layers_data_to_string(layers_by_id)}",
+    )
+
+    return layers_by_id
+
+
+def create_basemap_layer(basemap_config: BasemapConfig) -> QgsRasterLayer | None:
+    layer = QgsRasterLayer(
+        f"type=xyz&tilePixelRatio=1&url={basemap_config['url']}&zmax=19&zmin=0&crs=EPSG3857",
+        basemap_config["name"],
+        "wms",
+    )
+
+    if not layer.isValid():
+        return None
+
+    hue_saturation_filter = layer.hueSaturationFilter()
+
+    try:
+        style = BasemapStyle(basemap_config["style"])
+    except ValueError:
+        logger.warning(
+            f"Unknown basemap style '{basemap_config['style']}', using standard style."
+        )
+
+        style = BasemapStyle.STANDARD
+
+    if style == BasemapStyle.STANDARD:
+        # do nothing extra, all is good
+        pass
+    elif style == BasemapStyle.GRAYSCALE_LIGHT:
+        hue_saturation_filter.setGrayscaleMode(
+            QgsHueSaturationFilter.GrayscaleMode.GrayscaleLightness
+        )
+    elif style == BasemapStyle.GRAYSCALE_DARK:
+        hue_saturation_filter.setGrayscaleMode(
+            QgsHueSaturationFilter.GrayscaleMode.GrayscaleLightness
+        )
+        hue_saturation_filter.setInvertColors(True)
+    else:
+        raise NotImplementedError(f"Basemap style '{style}' is not implemented!")
+
+    return layer
+
+
+class CreateProjectCommand(QfcBaseCommand):
+    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("project_id", type=UUID, help="Project ID")
+
+    def get_workflow(self, project_id: UUID) -> Workflow:  # type: ignore
+        workflow = Workflow(
+            id="create_project",
+            name="Create Projectfile",
+            version="1.0",
+            steps=[
+                Step(
+                    id="start_qgis_app",
+                    name="Start QGIS Application",
+                    method=start_app,
+                    return_names=["qgis_version"],
+                ),
+                Step(
+                    id="get_project_seed",
+                    name="Get Project Seed",
+                    arguments={
+                        "project_id": project_id,
+                    },
+                    method=get_project_seed,
+                    return_names=["project_seed"],
+                ),
+                Step(
+                    id="get_project_seed_files",
+                    name="Get Project Seed Files",
+                    arguments={
+                        "project_id": project_id,
+                        "project_seed": StepOutput("get_project_seed", "project_seed"),
+                        "destination_dir": WorkDirPath(),
+                    },
+                    method=get_project_seed_files,
+                    return_names=["xlsform_filename", "json2qgis_filename"],
+                ),
+                Step(
+                    id="prepare_project_files",
+                    name="Prepare project files",
+                    arguments={
+                        "project_seed": StepOutput("get_project_seed", "project_seed"),
+                        "tmp_project_dir": WorkDirPath(),
+                        "xlsform_filename": StepOutput(
+                            "get_project_seed_files", "xlsform_filename"
+                        ),
+                        "json2qgis_filename": StepOutput(
+                            "get_project_seed_files", "json2qgis_filename"
+                        ),
+                    },
+                    method=prepare_project_files,
+                    return_names=["project_filename"],
+                ),
+                Step(
+                    id="configure_qgis_project",
+                    name="Configure QGIS project",
+                    arguments={
+                        "project_seed": StepOutput("get_project_seed", "project_seed"),
+                        "project_filename": StepOutput(
+                            "prepare_project_files", "project_filename"
+                        ),
+                    },
+                    method=configure_qgis_project,
+                    return_names=["qgis_project_file"],
+                ),
+                Step(
+                    id="qgis_layers_data",
+                    name="QGIS Layers Data",
+                    arguments={
+                        "the_qgis_file_name": StepOutput(
+                            "configure_qgis_project", "qgis_project_file"
+                        ),
+                    },
+                    method=extract_layer_data,
+                    return_names=["layers_by_id"],
+                    outputs=["layers_by_id"],
+                ),
+                Step(
+                    id="upload_project_directory",
+                    name="Upload Project",
+                    arguments={
+                        "project_id": project_id,
+                        "project_dir": WorkDirPath("files"),
+                    },
+                    method=upload_project,
+                ),
+                Step(
+                    id="stop_qgis_app",
+                    name="Stop QGIS Application",
+                    method=stop_app,
+                ),
+            ],
+        )
+
+        return workflow
+
+
+cmd = CreateProjectCommand()
+
+if __name__ == "__main__":
+    cmd.run_from_argv()

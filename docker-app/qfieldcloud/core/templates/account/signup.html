@@ -1,0 +1,71 @@
+{% extends 'account/base.html' %}
+{% load i18n %}
+{% load bootstrap4 %}
+
+{% block title_contents %}{% trans 'Registration' %}{% endblock %}
+
+
+{% block content %}
+
+<div class="card">
+  <div class="card-body">
+    <h5 class="card-title">{% trans 'Registration' %}</h5>
+    <p class="card-text">
+      {% url 'account_login' as login_url %}
+      {% blocktrans with login_url=login_url %}
+        Already have an account? Proceed to the <a href="{{ login_url }}">sign-in form</a>.
+      {% endblocktrans %}
+    </p>
+  </div>
+  <div class="card-body">
+    <form action="{% url 'account_signup' %}" method="POST">
+      {% csrf_token %}
+      {% bootstrap_form form %}
+
+      {% if redirect_field_value %}
+        <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}" />
+      {% endif %}
+
+      <div class="float-right">
+        <button class="btn btn-success" type="submit">{% trans 'Register' %}</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock content %}
+
+
+{% block additional_js %}
+<script type="application/javascript">
+  try {
+    const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    document.querySelector("#id_timezone").value = tzName;
+  } catch(err) {
+    console.error("Failed to automatically select timezone: ", err);
+  }
+
+  (() => {
+    const elCaptchaImage = document.querySelector('.qfc-captcha-image');
+    const elCaptchaBtn = document.querySelector('.qfc-captcha-btn');
+    const elCaptchaHidden = document.querySelector('input[name="captcha_0"]');
+
+    if (elCaptchaImage && elCaptchaBtn && elCaptchaHidden) {
+      elCaptchaBtn.addEventListener('click', () => {
+        fetch("/captcha/refresh/", { headers: { "X-Requested-With": "XMLHttpRequest" } })
+          .then(response => response.json())
+          .then(result => {
+            elCaptchaHidden.value = result['key'];
+            elCaptchaImage.src = result['image_url'];
+          })
+          .catch(err => {
+            console.error("Failed to refresh CAPTCHA: ", err);
+          });
+      });
+    } else {
+      console.error("Captcha elements not found in the DOM. Automatic refresh will not work.");
+    }
+  })();
+</script>
+{% endblock additional_js %}
