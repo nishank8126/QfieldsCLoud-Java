@@ -4,7 +4,7 @@ deprecated==3.0.1
 django-allauth[socialaccount]==65.21.1
 django-auditlog==3.4.2
 django-axes==9.0.0
-django-bootstrap4==26.2
+django-bootstrap4==26.3
 django-classy-tags==4.1.0
 django-cleanup==9.0.0
 django-cors-headers==4.9.0

@@ -80,7 +80,7 @@ django-auditlog==3.4.2
     # via -r requirements.in
 django-axes==9.0.0
     # via -r requirements.in
-django-bootstrap4==26.2
+django-bootstrap4==26.3
     # via -r requirements.in
 django-classy-tags==4.1.0
     # via -r requirements.in
