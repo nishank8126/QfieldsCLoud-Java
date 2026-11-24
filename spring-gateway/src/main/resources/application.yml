@@ -1,0 +1,34 @@
+spring:
+  application:
+    name: qfieldcloud-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  cloud:
+    gateway:
+      routes:
+        - id: core-api
+          uri: ${CORE_API_URL:http://localhost:8080}
+          predicates:
+            - Path=/api/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: ${RATE_LIMIT_REPLENISH:10}
+                redis-rate-limiter.burstCapacity: ${RATE_LIMIT_BURST:20}
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@userKeyResolver}"
+
+server:
+  port: ${GATEWAY_PORT:8090}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO

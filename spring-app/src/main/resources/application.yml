@@ -1,0 +1,123 @@
+spring:
+  application:
+    name: qfieldcloud-spring
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/qfieldcloud}
+    username: ${POSTGRES_USER:qfieldcloud}
+    password: ${POSTGRES_PASSWORD:qfieldcloud}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: qfieldcloud-pool
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:30000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:600000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
+  jpa:
+    hibernate:
+      # There are no JPA migrations in this module yet, so the schema is created/updated by Hibernate.
+      ddl-auto: ${JPA_DDL_AUTO:update}
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          lob:
+            non_contextual_creation: true
+
+  # Jackson / JSON
+  jackson:
+    serialization:
+      WRITE_DATES_AS_TIMESTAMPS: false
+    deserialization:
+      FAIL_ON_UNKNOWN_PROPERTIES: false
+
+  # Spring Data Redis: distributed cache for project lookups
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+  cache:
+    type: redis
+    redis:
+      time-to-live: 600000 # 10 minutes
+
+  # Spring AMQP: asynchronous survey (delta) processing via RabbitMQ
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    listener:
+      simple:
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1000
+
+  # Spring Batch: bulk land-record (delta) processing
+  batch:
+    job:
+      enabled: false # jobs are launched explicitly via the API, not on every app startup
+    jdbc:
+      initialize-schema: always
+
+# Resilience4j: fault tolerance around the external QField worker webhook
+resilience4j:
+  circuitbreaker:
+    instances:
+      worker-webhook:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 20s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+  retry:
+    instances:
+      worker-webhook:
+        max-attempts: 3
+        wait-duration: 500ms
+
+qfieldcloud:
+  host: ${QFIELDCLOUD_HOST:localhost}
+  admin-uri: ${QFIELDCLOUD_ADMIN_URI:/admin/}
+  auth-token-expiration-hours: ${QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS:24}
+  worker-timeout-s: ${QFIELDCLOUD_WORKER_TIMEOUT_S:3600}
+  worker-dequeue-interval-s: ${QFIELDCLOUD_WORKER_DEQUEUE_INTERVAL_S:5}
+  api-default-page-limit: ${QFIELDCLOUD_API_DEFAULT_PAGE_LIMIT:50}
+  user-list-limit: ${USER_LIST_LIMIT:20}
+  apply-deltas-limit: ${APPLY_DELTAS_LIMIT:1000}
+  environment: ${ENVIRONMENT:development}
+  default-language: ${QFIELDCLOUD_DEFAULT_LANGUAGE:en}
+  default-time-zone: ${QFIELDCLOUD_DEFAULT_TIME_ZONE:UTC}
+  jwt:
+    secret: ${QFIELDCLOUD_JWT_SECRET:base64encodedsecretkey32bytesminimumlengthhere!!}
+    expiration: ${QFIELDCLOUD_JWT_EXPIRATION:86400000}
+  worker:
+    webhook-url: ${QFIELDCLOUD_WORKER_WEBHOOK_URL:http://localhost:9999/worker/notify}
+    webhook-timeout-ms: ${QFIELDCLOUD_WORKER_WEBHOOK_TIMEOUT_MS:1500}
+
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    context-path: /api
+
+management:
+  endpoints:
+    web:
+      exposure:
+        health: true
+        info: true
+        metrics: true
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    com.qfieldcloud: INFO
+    org.springframework.web: INFO
+    org.hibernate.SQL: WARN
