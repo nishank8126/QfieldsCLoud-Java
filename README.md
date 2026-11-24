@@ -4,6 +4,14 @@ QFieldCloud is a Django based service designed to synchronize projects and data 
 
 QFieldCloud allows seamless synchronization of your field data with your spatial infrastructure with change tracking, team management and online-offline work capabilities in QField.
 
+## Spring Framework implementation
+
+This repository includes a Spring Boot 3 implementation in [`spring-app/`](spring-app/) and a Spring Cloud Gateway in [`spring-gateway/`](spring-gateway/). The Spring modules provide a Java alternative to the Django backend with compatible REST endpoints, JWT authentication, JPA/PostgreSQL persistence, Redis caching, RabbitMQ messaging, and Spring Batch support.
+
+The Spring implementation uses Java 17+ and Maven 3.8+, and can run with PostgreSQL or the included local H2 profile. API documentation is available through Swagger/OpenAPI, and the gateway forwards `/api/**` requests to the Spring application.
+
+The Spring modules are compatible with the QFieldCloud API approach for the implemented endpoints, but they are not yet a complete replacement for every Django feature. See [`spring-app/README.md`](spring-app/README.md) for endpoints, configuration, build instructions, Docker usage, and the current implementation limitations.
+
 
 ## Hosted solution
 
